@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <errno.h>
 #include <limits.h>
 #include <sys/types.h>
@@ -29,6 +30,7 @@
 #include <linux/fb.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <mntent.h>
 #include <x86/x86-linux.h>
 #include "../../kexec.h"
 #include "kexec-x86.h"
@@ -49,7 +51,7 @@ void setup_linux_bootloader_parameters(
 	struct kexec_info *info, struct x86_linux_param_header *real_mode,
 	unsigned long real_mode_base, unsigned long cmdline_offset,
 	const char *cmdline, off_t cmdline_len,
-	const unsigned char *initrd_buf, off_t initrd_size)
+	const char *initrd_buf, off_t initrd_size)
 {
 	char *cmdline_ptr;
 	unsigned long initrd_base, initrd_addr_max;
@@ -353,8 +355,7 @@ static void zero_edd(struct x86_linux_param_header *real_mode)
 		EDD_MBR_SIG_MAX * sizeof(uint32_t));
 }
 
-void setup_edd_info(struct x86_linux_param_header *real_mode,
-					unsigned long kexec_flags)
+void setup_edd_info(struct x86_linux_param_header *real_mode)
 {
 	DIR *edd_dir;
 	struct dirent *cursor;
@@ -397,12 +398,62 @@ out:
 		real_mode->eddbuf_entries);
 }
 
+/*
+ * This really only makes sense for virtual filesystems that are only expected
+ * to be mounted once (sysfs, debugsfs, proc), as it will return the first
+ * instance listed in mtab.
+ */
+char *find_mnt_by_fsname(char *fsname)
+{
+	FILE *mtab;
+	struct mntent *mnt;
+	char *mntdir;
+
+	mtab = setmntent("/etc/mtab", "r");
+	if (!mtab)
+		return NULL;
+	for(mnt = getmntent(mtab); mnt; mnt = getmntent(mtab)) {
+		if (strcmp(mnt->mnt_fsname, fsname) == 0)
+			break;
+	}
+	mntdir = mnt ? strdup(mnt->mnt_dir) : NULL;
+	endmntent(mtab);
+	return mntdir;
+}
+
+void setup_subarch(struct x86_linux_param_header *real_mode)
+{
+	int data_file;
+	const off_t offset = offsetof(typeof(*real_mode), hardware_subarch);
+	char *debugfs_mnt;
+	char filename[PATH_MAX];
+
+	debugfs_mnt = find_mnt_by_fsname("debugfs");
+	if (!debugfs_mnt)
+		return;
+	snprintf(filename, PATH_MAX, "%s/%s", debugfs_mnt, "boot_params/data");
+	filename[PATH_MAX-1] = 0;
+	free(debugfs_mnt);
+
+	data_file = open(filename, O_RDONLY);
+	if (data_file < 0)
+		return;
+	if (lseek(data_file, offset, SEEK_SET) < 0)
+		goto close;
+	read(data_file, &real_mode->hardware_subarch, sizeof(uint32_t));
+close:
+	close(data_file);
+}
+
 void setup_linux_system_parameters(struct x86_linux_param_header *real_mode,
 					unsigned long kexec_flags)
 {
 	/* Fill in information the BIOS would usually provide */
 	struct memory_range *range;
 	int i, ranges;
+
+	/* get subarch from running kernel */
+	setup_subarch(real_mode);
 	
 	/* Default screen size */
 	real_mode->orig_x = 0;
@@ -482,5 +533,5 @@ void setup_linux_system_parameters(struct x86_linux_param_header *real_mode,
 	}
 
 	/* fill the EDD information */
-	setup_edd_info(real_mode, kexec_flags);
+	setup_edd_info(real_mode);
 }

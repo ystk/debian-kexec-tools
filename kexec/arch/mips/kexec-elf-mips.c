@@ -25,55 +25,20 @@
 #include <ip_checksum.h>
 #include "../../kexec.h"
 #include "../../kexec-elf.h"
+#include "../../kexec-syscall.h"
 #include "kexec-mips.h"
+#include "crashdump-mips.h"
 #include <arch/options.h>
 
 static const int probe_debug = 0;
 
 #define BOOTLOADER         "kexec"
 #define MAX_COMMAND_LINE   256
-
 #define UPSZ(X) ((sizeof(X) + 3) & ~3)
-static struct boot_notes {
-	Elf_Bhdr hdr;
-	Elf_Nhdr bl_hdr;
-	unsigned char bl_desc[UPSZ(BOOTLOADER)];
-	Elf_Nhdr blv_hdr;
-	unsigned char blv_desc[UPSZ(BOOTLOADER_VERSION)];
-	Elf_Nhdr cmd_hdr;
-	unsigned char command_line[0];
-} elf_boot_notes = {
-	.hdr = {
-		.b_signature = 0x0E1FB007,
-		.b_size = sizeof(elf_boot_notes),
-		.b_checksum = 0,
-		.b_records = 3,
-	},
-	.bl_hdr = {
-		.n_namesz = 0,
-		.n_descsz = sizeof(BOOTLOADER),
-		.n_type = EBN_BOOTLOADER_NAME,
-	},
-	.bl_desc = BOOTLOADER,
-	.blv_hdr = {
-		.n_namesz = 0,
-		.n_descsz = sizeof(BOOTLOADER_VERSION),
-		.n_type = EBN_BOOTLOADER_VERSION,
-	},
-	.blv_desc = BOOTLOADER_VERSION,
-	.cmd_hdr = {
-		.n_namesz = 0,
-		.n_descsz = 0,
-		.n_type = EBN_COMMAND_LINE,
-	},
-};
-
-
-#define OPT_APPEND	(OPT_ARCH_MAX+0)
+static char cmdline_buf[256] = "kexec ";
 
 int elf_mips_probe(const char *buf, off_t len)
 {
-
 	struct mem_ehdr ehdr;
 	int result;
 	result = build_elf_exec_info(buf, len, &ehdr, 0);
@@ -108,16 +73,15 @@ int elf_mips_load(int argc, char **argv, const char *buf, off_t len,
 	struct kexec_info *info)
 {
 	struct mem_ehdr ehdr;
-	char *arg_buf;
-	size_t arg_bytes;
-	unsigned long arg_base;
-	struct boot_notes *notes;
-	size_t note_bytes;
 	const char *command_line;
 	int command_line_len;
-	unsigned char *setup_start;
-	uint32_t setup_size;
+	char *crash_cmdline;
 	int opt;
+	int result;
+	unsigned long cmdline_addr;
+	size_t i;
+
+	/* See options.h if adding any more options. */
 	static const struct option options[] = {
 		KEXEC_ARCH_OPTIONS
 		{"command-line", 1, 0, OPT_APPEND},
@@ -144,38 +108,67 @@ int elf_mips_load(int argc, char **argv, const char *buf, off_t len,
 			break;
 		}
 	}
+
 	command_line_len = 0;
-	setup_simple_regs.spr9 = 0;
-	if (command_line) {
-		command_line_len = strlen(command_line) + 1;
-		setup_simple_regs.spr9 = 2;
+
+	/* Need to append some command line parameters internally in case of
+	 * taking crash dumps.
+	 */
+	if (info->kexec_flags & KEXEC_ON_CRASH) {
+		crash_cmdline = xmalloc(COMMAND_LINE_SIZE);
+		memset((void *)crash_cmdline, 0, COMMAND_LINE_SIZE);
+	} else
+		crash_cmdline = NULL;
+
+	result = build_elf_exec_info(buf, len, &ehdr, 0);
+	if (result < 0)
+		die("ELF exec parse failed\n");
+
+	/* Read in the PT_LOAD segments and remove CKSEG0 mask from address*/
+	for (i = 0; i < ehdr.e_phnum; i++) {
+		struct mem_phdr *phdr;
+		phdr = &ehdr.e_phdr[i];
+		if (phdr->p_type == PT_LOAD)
+			phdr->p_paddr = virt_to_phys(phdr->p_paddr);
 	}
 
-	/* Load the ELF executable */
-	elf_exec_build_load(info, &ehdr, buf, len, 0);
+	/* Load the Elf data */
+	result = elf_exec_load(&ehdr, info);
+	if (result < 0)
+		die("ELF exec load failed\n");
 
-	setup_start = setup_simple_start;
-	setup_size = setup_simple_size;
-	setup_simple_regs.spr8 = ehdr.e_entry;
+	info->entry = (void *)virt_to_phys(ehdr.e_entry);
 
-	note_bytes = sizeof(elf_boot_notes) + ((command_line_len + 3) & ~3);
-	arg_bytes = note_bytes + ((setup_size + 3) & ~3);
+	if (command_line)
+		command_line_len = strlen(command_line) + 1;
 
-	arg_buf = xmalloc(arg_bytes);
-	arg_base = add_buffer_virt(info,
-		 arg_buf, arg_bytes, arg_bytes, 4, 0, elf_max_addr(&ehdr), 1);
+	if (info->kexec_flags & KEXEC_ON_CRASH) {
+		result = load_crashdump_segments(info, crash_cmdline,
+				0, 0);
+		if (result < 0) {
+			free(crash_cmdline);
+			return -1;
+		}
+	}
 
-	notes = (struct boot_notes *)(arg_buf + ((setup_size + 3) & ~3));
+	if (command_line)
+		strncat(cmdline_buf, command_line, command_line_len);
+	if (crash_cmdline)
+		strncat(cmdline_buf, crash_cmdline,
+				sizeof(crash_cmdline) -
+				strlen(crash_cmdline) - 1);
 
-	memcpy(arg_buf, setup_start, setup_size);
-	memcpy(notes, &elf_boot_notes, sizeof(elf_boot_notes));
-	memcpy(notes->command_line, command_line, command_line_len);
+	if (info->kexec_flags & KEXEC_ON_CRASH)
+		/* In case of crashdump segment[0] is kernel.
+		 * Put cmdline just after it. */
+		cmdline_addr = info->segment[0].mem +
+				info->segment[0].memsz;
+	else
+		cmdline_addr = 0;
 
-	notes->hdr.b_size = note_bytes;
-	notes->cmd_hdr.n_descsz = command_line_len;
-	notes->hdr.b_checksum = compute_ip_checksum(notes, note_bytes);
-
-	info->entry = (void *)arg_base;
+	add_buffer(info, cmdline_buf, sizeof(cmdline_buf),
+			sizeof(cmdline_buf), sizeof(void *),
+			cmdline_addr, 0x0fffffff, 1);
 
 	return 0;
 }

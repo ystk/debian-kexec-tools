@@ -13,6 +13,7 @@
 #define _GNU_SOURCE
 
 #include "kexec-elf.h"
+#include "unused.h"
 
 #ifndef BYTE_ORDER
 #error BYTE_ORDER not defined
@@ -121,9 +122,8 @@ struct kexec_info {
 	struct mem_ehdr rhdr;
 	unsigned long backup_start;
 	unsigned long kexec_flags;
-	unsigned long kern_vaddr_start;
-	unsigned long kern_paddr_start;
-	unsigned long kern_size;
+	unsigned long backup_src_start;
+	unsigned long backup_src_size;
 };
 
 struct arch_map_entry {
@@ -133,6 +133,10 @@ struct arch_map_entry {
 
 extern const struct arch_map_entry arches[];
 long physical_arch(void);
+
+#define KERNEL_VERSION(major, minor, patch) \
+	(((major) << 16) | ((minor) << 8) | patch)
+long kernel_version(void);
 
 void usage(void);
 int get_memory_ranges(struct memory_range **range, int *ranges,
@@ -225,7 +229,7 @@ extern void arch_reuse_initrd(void);
 
 extern int ifdown(void);
 
-extern unsigned char purgatory[];
+extern char purgatory[];
 extern size_t purgatory_size;
 
 #define BOOTLOADER "kexec"
@@ -258,7 +262,9 @@ extern int add_backup_segments(struct kexec_info *info,
 #define dbgprintf(_args...) do {printf(_args);} while(0)
 #else
 static inline int __attribute__ ((format (printf, 1, 2)))
-	dbgprintf(const char *fmt, ...) {return 0;}
+	dbgprintf(const char *UNUSED(fmt), ...) {return 0;}
 #endif
+
+char *concat_cmdline(const char *base, const char *append);
 
 #endif /* KEXEC_H */
