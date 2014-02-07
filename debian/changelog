@@ -1,3 +1,63 @@
+kexec-tools (1:2.0.3-1) unstable; urgency=low
+
+  * New upstream release
+  * Switched to dpkg-source 3.0 (quilt) format
+  * Updated kexec and coldreboot man pages (closes: Bug#653197)
+  * Added armhf architecture (closes: Bug#645652)
+
+ -- Khalid Aziz <khalid@debian.org>  Tue, 31 Jan 2012 09:11:31 -0700
+
+kexec-tools (1:2.0.2-3) unstable; urgency=low
+
+  * Added check for link_in_boot in kernel-img.conf and update kexec
+    kernel and initrd locations accordingly in kexec config file 
+    (closes: Bug#577064)
+  * Added a check for /boot/grub directory before asking if kexec should use
+    grub config (Closes: Bug#643306)
+  * Added to SH4 to supported arch and changed arch for udeb to list of 
+    supported Linux platforms (closes: Bug#600778)
+  * Corrected the malformed patch update_kexec_manpage.dpatch
+  * Added build-arch and build-indep targets to debian/rules
+  * Debconf templates and debian/control reviewed by the debian-l10n-
+    english team as part of the Smith review project. Closes: #639226, #636780
+  * [Debconf translation updates]
+  * Slovak (Slavko).  Closes: #639305
+  * Russian (Yuri Kozlov).  Closes: #637753
+  * Swedish (Martin Bagge / brother).  Closes: #640049
+  * French (Steve Petruzzello).  Closes: #640092
+  * Czech (Miroslav Kure).  Closes: #640218
+  * Danish (Joe Hansen).  Closes: #640408
+  * Portuguese (Rui Branco).  Closes: #640858
+  * Dutch; (Jeroen Schot).  Closes: #640989
+  * Spanish; (Camaleón).  Closes: #640994
+  * German (Helge Kreutzmann).  Closes: #641143
+
+ -- Khalid Aziz <khalid@debian.org>  Tue, 11 Oct 2011 10:56:59 -0600
+
+kexec-tools (1:2.0.2-2) unstable; urgency=low
+
+  * Fixed the problem with --no-undefined option being used for gcc. 
+    Applied Matthias's patch (closes: Bug#610517, Bug#624897) 
+  * Replaced copyright info in debian/copyright with list of authors
+    and ensured link to license pionts to GPLv2 (closes: Bug#485679)
+  * Updated PATH in init scripts to make sure /sbin and /bin are searched 
+    before other paths (closes: Bug#581219)
+  * Corrected kexec man page to not say shutdown is called on kexec -e
+    (closes: Bug#609462)
+  * Added option to use grub configuration to load kernel (close: Bug#525356)
+
+ -- Khalid Aziz <khalid@debian.org>  Sun, 31 Jul 2011 14:30:31 -0600
+
+kexec-tools (1:2.0.2-1) unstable; urgency=low
+
+  * New upstream release (closes: Bug#623814)
+  * Updated watch file (closes: Bug#623813)
+  * Updated URL in copyright file
+  * Updated linitian overrides file to match path name for new lintian
+  * Added source/lintian-overrides file to override innocuous lintian errors
+
+ -- Khalid Aziz <khalid@debian.org>  Thu, 28 Apr 2011 13:06:41 -0600
+
 kexec-tools (1:2.0.1-4) unstable; urgency=low
 
   * Fix pending l10n issues. Debconf translations:
@@ -17,7 +77,7 @@ kexec-tools (1:2.0.1-3) unstable; urgency=low
 kexec-tools (1:2.0.1-2) unstable; urgency=low
 
   * Fixed kernel load failure on "armv5tel" architecture (closes: Bug#564648)
-  * Added a script, codreboot, to force a cold reboot (closes: Bug#519950)
+  * Added a script, coldreboot, to force a cold reboot (closes: Bug#519950)
   * Added dependency dependency upon local filesystem to ensure filesystem
     containing kexec image is not unmounted before kexec-load runs 
     (closes: Bug#578126)

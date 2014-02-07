@@ -104,15 +104,7 @@ PKGDATADIR=$(DATADIR)/$(PACKAGE_NAME)
 PKGLIBDIR=$(LIBDIR)/$(PACKAGE_NAME)
 PKGINCLUDEIR=$(INCLUDEDIR)/$(PACKAGE_NAME)
 
-MAN_PAGES:= kexec/kexec.8
-MAN_PAGES+= kdump/kdump.8
-BINARIES_i386:=  $(SBINDIR)/kexec $(PKGLIBDIR)/kexec_test
-BINARIES_x86_64:=$(SBINDIR)/kexec $(PKGLIBDIR)/kexec_test
-BINARIES:=$(SBINDIR)/kexec $(SBINDIR)/kdump $(BINARIES_$(ARCH))
-
-TARGETS:=$(BINARIES) $(MAN_PAGES)
-
-all: $(TARGETS)
+all: targets
 
 # generic build rules
 %.o: %.c
@@ -126,7 +118,6 @@ all: $(TARGETS)
 # collect objects to be removed in 'make clean'
 clean =
 
-# collect objects to be removed in 'make clean'
 dist =	AUTHORS COPYING INSTALL News TODO Makefile.in configure.ac configure \
 	kexec-tools.spec.in config/
 
@@ -167,6 +158,10 @@ include $(srcdir)/kexec/Makefile
 #
 include $(srcdir)/kdump/Makefile
 
+# vmcore-dmesg (read dmesg from a vmcore)
+#
+include $(srcdir)/vmcore-dmesg/Makefile
+
 #
 # kexec_test (test program)
 #
@@ -179,6 +174,15 @@ TARBALL.gz=$(TARBALL).gz
 SRCS:= $(dist)
 PSRCS:=$(foreach s, $(SRCS), $(PACKAGE_NAME)-$(PACKAGE_VERSION)/$(s))
 PGSRCS:=$(foreach s, $(GENERATED_SRCS), $(PACKAGE_NAME)-$(PACKAGE_VERSION)/$(s))
+
+MAN_PAGES:=$(KEXEC_MANPAGE) $(KDUMP_MANPAGE) $(VMCORE_DMESG_MANPAGE)
+BINARIES_i386:=$(KEXEC_TEST) $(KEXEC_TEST)
+BINARIES_x86_64:=$(KEXEC) $(KDUMP) $(BINARIES_$(ARCH))
+BINARIES:=$(KEXEC) $(KDUMP) $(VMCORE_DMESG) $(BINARIES_$(ARCH))
+
+TARGETS:=$(BINARIES) $(MAN_PAGES)
+
+targets: $(TARGETS)
 
 Makefile: Makefile.in config.status
 	./config.status
@@ -201,19 +205,9 @@ $(TARBALL): $(SRCS) $(GENERATED_SRCS)
 $(TARBALL.gz): $(TARBALL)
 	gzip -c < $^ > $@
 
-RPMDIR=rpm
-rpm: $(TARBALL)
-	$(MKDIR) -p $(RPMDIR)/RPM $(RPMDIR)/SRPM $(RPMDIR)/BUILD \
-		$(RPMDIR)/SPECS $(RPMDIR)/TMP $(RPMDIR)/SOURCES
-	unset MAKEFLAGS MAKELEVEL; \
-	$(RPMBUILD) -ta \
-		--define '_rpmdir $(RPMDIR)/RPM' \
-		--define '_srcrpmdir $(RPMDIR)/SRPM' \
-		--define '_builddir $(RPMDIR)/BUILD' \
-		--define '_specdir $(RPMDIR)/SPECS' \
-		--define '_tmppath $(RPMDIR)/TMP' \
-		--define '_sourcedir $(RPMDIR)/SOURCES' \
-		$(TARBALL)
+rpm: $(TARBALL.gz)
+	unset MAKEFLAGS MAKELEVEL;
+	$(RPMBUILD) -ta $(TARBALL.gz)
 
 $(SPEC): kexec-tools.spec.in Makefile
 	$(SED) -e 's,^Version: $$,Version: $(PACKAGE_VERSION),' $< > $@
@@ -228,14 +222,14 @@ echo::
 
 clean:
 	$(RM) -f $(clean)
-	$(RM) -rf rpm build
+	$(RM) -rf build
 	$(RM) -f $(TARBALL) $(TARBALL.gz)
 
 distclean: dist-clean
 
 dist-clean: clean
 	$(RM) -f config.log config.status config.cache Makefile include/config.h
-	$(RM) -f include/config.h.in configure
+	$(RM) -f include/config.h.in configure $(SPEC)
 	$(RM) -rf autom4te.cache
 
 install: $(TARGETS)
@@ -326,5 +320,5 @@ install: $(TARGETS)
 		fi; \
 	done
 
-.PHONY: echo install all clean dist-clean distclean maintainer-clean 	\
-	maintainerclean tarball rpm
+.PHONY: echo install all targets clean dist-clean distclean \
+	maintainer-clean maintainerclean tarball rpm
