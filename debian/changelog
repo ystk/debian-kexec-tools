@@ -1,3 +1,49 @@
+kexec-tools (1:2.0.4-1) unstable; urgency=low
+
+  * New upstream release
+  * Removed crashdump_warning.patch since it is in upstream now
+  * Removed update_kexec_manpage.patch since it is in upstream now
+  * Updated watch file to look for more extensions that tgz and tar.gz, as 
+    suggested by someone on PTS
+  * Added support for parallel make (closes: Bug#727130)
+  * Added support for grub2's saved_entry (closes: Bug#699007)
+
+ -- Khalid Aziz <khalid@debian.org>  Fri, 08 Nov 2013 16:38:16 -0700
+
+kexec-tools (1:2.0.3-4) unstable; urgency=low
+
+  * Drop the dependency on grub2 which is not quite right 
+    (closes: Bug#717953, closes: Bug#718260)
+
+ -- Khalid Aziz <khalid@debian.org>  Mon, 29 Jul 2013 08:16:59 -0600
+
+kexec-tools (1:2.0.3-3) unstable; urgency=low
+
+  * Fixed kexec-load init script to parse newer grub.cfg files correctly
+    (closes: Bug#714016)
+  * Replaced echo in kexec init script with printf to avoid bashism
+    (closes: Bug#701551)
+  * Fixed the "kexec -p" failure with kernel versions of the form x.y
+    (closes: Bug#708034)
+  * Updated japanese translation (Thank you Victory and Japanese Debian 
+    Developers) (closes: Bug#717206)
+  * Added mips and mipsel to supported architectures (closes: Bug#711274)
+
+ -- Khalid Aziz <khalid@debian.org>  Thu, 25 Jul 2013 13:57:30 -0600
+
+kexec-tools (1:2.0.3-2) unstable; urgency=low
+
+  * Changed the default for kexec to not be enabled, and changed the 
+    priority of debconf question for enabling kexec by default to
+    high (closes: Bug#638261)
+  * Handle the case of a separate /boot partition (closes: Bug#687956)
+  * Updated to use hardening rules
+  * Added full path to the calls to kexec in init scripts to make sure 
+    it works reliably.
+  * Added code to clear screen before rebooting (closes: Bug#606955)
+
+ -- Khalid Aziz <khalid@debian.org>  Sun, 13 Jan 2013 19:39:31 -0700
+
 kexec-tools (1:2.0.3-1) unstable; urgency=low
 
   * New upstream release

@@ -10,6 +10,9 @@
 #export DH_VERBOSE=1
 
 
+ifneq (,$(filter parallel=%,$(subst $(COMMA), ,$(DEB_BUILD_OPTIONS))))
+	NJOBS := -j $(subst parallel=,,$(filter parallel=%,$(subst $(COMMA), ,$(DEB_BUILD_OPTIONS))))
+endif
 
 CFLAGS = -Wall -g
 
@@ -25,7 +28,7 @@ configure-stamp:
 	# Add here commands to configure the package.
 	autoheader
 	autoconf
-	./configure --prefix=/usr --sbindir=/sbin --mandir=/usr/share/man --datadir=/usr/share
+	CPPFLAGS="$(shell dpkg-buildflags --get CPPFLAGS)" CFLAGS="$(shell dpkg-buildflags --get CFLAGS)" LDFLAGS="$(shell dpkg-buildflags --get LDFLAGS)" ./configure --prefix=/usr --sbindir=/sbin --mandir=/usr/share/man --datadir=/usr/share
 
 	touch configure-stamp
 
@@ -38,7 +41,7 @@ build-stamp: configure-stamp
 	dh_testdir
 
 	# Add here commands to compile the package.
-	$(MAKE)
+	$(MAKE) $(NJOBS)
 
 	touch build-stamp
 
