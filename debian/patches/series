@@ -1,0 +1,9 @@
+debianize.patch
+static_binary_warning.patch
+distclean_fix.patch
+add_debian_readme.patch
+coldreboot.patch
+linker-option.patch
+const_string_warning.patch
+powerpcspe_support.patch
+allow-external-build-date.patch
