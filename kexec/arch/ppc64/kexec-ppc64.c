@@ -31,6 +31,7 @@
 #include "../../kexec.h"
 #include "../../kexec-syscall.h"
 #include "kexec-ppc64.h"
+#include "../../fs2dt.h"
 #include "crashdump-ppc64.h"
 #include <arch/options.h>
 
@@ -39,9 +40,11 @@ static struct memory_range *memory_range = NULL;
 static struct memory_range *base_memory_range = NULL;
 static uint64_t rmo_top;
 uint64_t memory_max = 0;
+uint64_t memory_limit;
 static int nr_memory_ranges, nr_exclude_ranges;
 uint64_t crash_base, crash_size;
 unsigned int rtas_base, rtas_size;
+uint64_t opal_base, opal_size;
 int max_memory_ranges;
 
 static void cleanup_memory_ranges(void)
@@ -148,7 +151,8 @@ static int get_dyn_reconf_base_ranges(void)
 	uint64_t start, end;
 	char fname[128], buf[32];
 	FILE *file;
-	int i, n;
+	unsigned int i;
+	int n;
 
 	strcpy(fname, "/proc/device-tree/");
 	strcat(fname, "ibm,dynamic-reconfiguration-memory/ibm,lmb-size");
@@ -165,7 +169,7 @@ static int get_dyn_reconf_base_ranges(void)
 	 * lmb_size, num_of_lmbs(global variables) are
 	 * initialized once here.
 	 */
-	lmb_size = ((uint64_t *)buf)[0];
+	lmb_size = be64_to_cpu(((uint64_t *)buf)[0]);
 	fclose(file);
 
 	strcpy(fname, "/proc/device-tree/");
@@ -181,7 +185,7 @@ static int get_dyn_reconf_base_ranges(void)
 		fclose(file);
 		return -1;
 	}
-	num_of_lmbs = ((unsigned int *)buf)[0];
+	num_of_lmbs = be32_to_cpu(((unsigned int *)buf)[0]);
 
 	for (i = 0; i < num_of_lmbs; i++) {
 		if ((n = fread(buf, 1, 24, file)) < 0) {
@@ -192,7 +196,7 @@ static int get_dyn_reconf_base_ranges(void)
 		if (nr_memory_ranges >= max_memory_ranges)
 			return -1;
 
-		start = ((uint64_t *)buf)[0];
+		start = be64_to_cpu(((uint64_t *)buf)[0]);
 		end = start + lmb_size;
 		add_base_memory_range(start, end);
 	}
@@ -276,8 +280,8 @@ static int get_base_ranges(void)
 				if (realloc_memory_ranges() < 0)
 					break;
 			}
-			start = ((uint64_t *)buf)[0];
-			end = start + ((uint64_t *)buf)[1];
+			start =  be64_to_cpu(((uint64_t *)buf)[0]);
+			end = start + be64_to_cpu(((uint64_t *)buf)[1]);
 			add_base_memory_range(start, end);
 			fclose(file);
 		}
@@ -311,6 +315,47 @@ static int sort_ranges(void)
 	return 0;
 }
 
+void scan_reserved_ranges(unsigned long kexec_flags, int *range_index)
+{
+	char fname[256], buf[16];
+	FILE *file;
+	int i = *range_index;
+
+	strcpy(fname, "/proc/device-tree/reserved-ranges");
+
+	file = fopen(fname, "r");
+	if (file == NULL) {
+		if (errno != ENOENT) {
+			perror(fname);
+			return;
+		}
+		errno = 0;
+		/* File not present. Non PowerKVM system. */
+		return;
+	}
+
+	/*
+	 * Each reserved range is an (address,size) pair, 2 cells each,
+	 * totalling 4 cells per range.
+	 */
+	while (fread(buf, sizeof(uint64_t) * 2, 1, file) == 1) {
+		uint64_t base, size;
+
+		base = be64_to_cpu(((uint64_t *)buf)[0]);
+		size = be64_to_cpu(((uint64_t *)buf)[1]);
+
+		exclude_range[i].start = base;
+		exclude_range[i].end = base + size;
+		i++;
+		if (i >= max_memory_ranges)
+			realloc_memory_ranges();
+
+		reserve(base, size);
+	}
+	fclose(file);
+	*range_index = i;
+}
+
 /* Get devtree details and create exclude_range array
  * Also create usablemem_ranges for KEXEC_ON_CRASH
  */
@@ -336,14 +381,15 @@ static int get_devtree_details(unsigned long kexec_flags)
 		return -1;
 	}
 
+	scan_reserved_ranges(kexec_flags, &i);
+
 	while ((dentry = readdir(dir)) != NULL) {
 		if (strncmp(dentry->d_name, "chosen", 6) &&
 			strncmp(dentry->d_name, "memory@", 7) &&
 			strcmp(dentry->d_name, "memory") &&
 			strncmp(dentry->d_name, "pci@", 4) &&
 			strncmp(dentry->d_name, "rtas", 4) &&
-			strncmp(dentry->d_name,
-				"ibm,dynamic-reconfiguration-memory", 35))
+			strncmp(dentry->d_name, "ibm,opal", 8))
 			continue;
 		strcpy(fname, device_tree);
 		strcat(fname, dentry->d_name);
@@ -363,6 +409,7 @@ static int get_devtree_details(unsigned long kexec_flags)
 				goto error_openfile;
 			}
 			fclose(file);
+			kernel_end = be64_to_cpu(kernel_end);
 
 			/* Add kernel memory to exclude_range */
 			exclude_range[i].start = 0x0UL;
@@ -386,6 +433,7 @@ static int get_devtree_details(unsigned long kexec_flags)
 					goto error_openfile;
 				}
 				fclose(file);
+				crash_base = be64_to_cpu(crash_base);
 
 				memset(fname, 0, sizeof(fname));
 				strcpy(fname, device_tree);
@@ -400,6 +448,8 @@ static int get_devtree_details(unsigned long kexec_flags)
 					perror(fname);
 					goto error_openfile;
 				}
+				fclose(file);
+				crash_size = be64_to_cpu(crash_size);
 
 				if (crash_base > mem_min)
 					mem_min = crash_base;
@@ -408,6 +458,36 @@ static int get_devtree_details(unsigned long kexec_flags)
 				
 				add_usable_mem_rgns(0, crash_base + crash_size);
 				reserve(KDUMP_BACKUP_LIMIT, crash_base-KDUMP_BACKUP_LIMIT);
+			}
+			/*
+			 * Read the first kernel's memory limit.
+			 * If the first kernel is booted with mem= option then
+			 * it would export "linux,memory-limit" file
+			 * reflecting value for the same.
+			 */
+			memset(fname, 0, sizeof(fname));
+			strcpy(fname, device_tree);
+			strcat(fname, dentry->d_name);
+			strcat(fname, "/linux,memory-limit");
+			if ((file = fopen(fname, "r")) == NULL) {
+				if (errno != ENOENT) {
+					perror(fname);
+					goto error_opencdir;
+				}
+				errno = 0;
+				/*
+				 * File not present.
+				 * fall through. On older kernel this file
+				 * is not present.
+				 */
+			} else {
+				if (fread(&memory_limit, sizeof(uint64_t), 1,
+					  file) != 1) {
+					perror(fname);
+					goto error_openfile;
+				}
+				fclose(file);
+				memory_limit = be64_to_cpu(memory_limit);
 			}
 
 			memset(fname, 0, sizeof(fname));
@@ -428,6 +508,9 @@ static int get_devtree_details(unsigned long kexec_flags)
 				perror(fname);
 				goto error_openfile;
 			}
+			fclose(file);
+			htab_base = be64_to_cpu(htab_base);
+
 			memset(fname, 0, sizeof(fname));
 			strcpy(fname, device_tree);
 			strcat(fname, dentry->d_name);
@@ -440,6 +523,9 @@ static int get_devtree_details(unsigned long kexec_flags)
 				perror(fname);
 				goto error_openfile;
 			}
+			fclose(file);
+			htab_size = be64_to_cpu(htab_size);
+
 			/* Add htab address to exclude_range - NON-LPAR only */
 			exclude_range[i].start = htab_base;
 			exclude_range[i].end = htab_base + htab_size;
@@ -466,6 +552,7 @@ static int get_devtree_details(unsigned long kexec_flags)
 					perror(fname);
 					goto error_openfile;
 				}
+				initrd_start = be64_to_cpu(initrd_start);
 				fclose(file);
 
 				memset(fname, 0, sizeof(fname));
@@ -485,6 +572,7 @@ static int get_devtree_details(unsigned long kexec_flags)
 					perror(fname);
 					goto error_openfile;
 				}
+				initrd_end = be64_to_cpu(initrd_end);
 				fclose(file);
 
 				/* Add initrd address to exclude_range */
@@ -506,6 +594,8 @@ static int get_devtree_details(unsigned long kexec_flags)
 				perror(fname);
 				goto error_openfile;
 			}
+			fclose(file);
+			rtas_base = be32_to_cpu(rtas_base);
 			memset(fname, 0, sizeof(fname));
 			strcpy(fname, device_tree);
 			strcat(fname, dentry->d_name);
@@ -518,7 +608,9 @@ static int get_devtree_details(unsigned long kexec_flags)
 				perror(fname);
 				goto error_openfile;
 			}
+			fclose(file);
 			closedir(cdir);
+			rtas_size = be32_to_cpu(rtas_size);
 			/* Add rtas to exclude_range */
 			exclude_range[i].start = rtas_base;
 			exclude_range[i].end = rtas_base + rtas_size;
@@ -528,6 +620,46 @@ static int get_devtree_details(unsigned long kexec_flags)
 			if (kexec_flags & KEXEC_ON_CRASH)
 				add_usable_mem_rgns(rtas_base, rtas_size);
 		} /* rtas */
+
+		if (strncmp(dentry->d_name, "ibm,opal", 8) == 0) {
+			strcat(fname, "/opal-base-address");
+			file = fopen(fname, "r");
+			if (file == NULL) {
+				perror(fname);
+				goto error_opencdir;
+			}
+			if (fread(&opal_base, sizeof(uint64_t), 1, file) != 1) {
+				perror(fname);
+				goto error_openfile;
+			}
+			opal_base = be64_to_cpu(opal_base);
+			fclose(file);
+
+			memset(fname, 0, sizeof(fname));
+			strcpy(fname, device_tree);
+			strcat(fname, dentry->d_name);
+			strcat(fname, "/opal-runtime-size");
+			file = fopen(fname, "r");
+			if (file == NULL) {
+				perror(fname);
+				goto error_opencdir;
+			}
+			if (fread(&opal_size, sizeof(uint64_t), 1, file) != 1) {
+				perror(fname);
+				goto error_openfile;
+			}
+			fclose(file);
+			closedir(cdir);
+			opal_size = be64_to_cpu(opal_size);
+			/* Add OPAL to exclude_range */
+			exclude_range[i].start = opal_base;
+			exclude_range[i].end = opal_base + opal_size;
+			i++;
+			if (i >= max_memory_ranges)
+				realloc_memory_ranges();
+			if (kexec_flags & KEXEC_ON_CRASH)
+				add_usable_mem_rgns(opal_base, opal_size);
+		} /* ibm,opal */
 
 		if (!strncmp(dentry->d_name, "memory@", 7) ||
 			!strcmp(dentry->d_name, "memory")) {
@@ -540,37 +672,14 @@ static int get_devtree_details(unsigned long kexec_flags)
 				perror(fname);
 				goto error_openfile;
 			}
-			rmo_base = ((uint64_t *)buf)[0];
-			rmo_top = rmo_base + ((uint64_t *)buf)[1];
+			rmo_base = be64_to_cpu(((uint64_t *)buf)[0]);
+			rmo_top = rmo_base + be64_to_cpu(((uint64_t *)buf)[1]);
 			if (rmo_top > 0x30000000UL)
 				rmo_top = 0x30000000UL;
 
 			fclose(file);
 			closedir(cdir);
 		} /* memory */
-
-		if (!strncmp(dentry->d_name,
-				"ibm,dynamic-reconfiguration-memory", 35)) {
-			unsigned int k;
-			strcat(fname, "/ibm,dynamic-memory");
-			if ((file = fopen(fname, "r")) == NULL) {
-				perror(fname);
-				goto error_opencdir;
-			}
-			fseek(file, 4, SEEK_SET);
-			for (k = 0; k < num_of_lmbs; k++) {
-				if ((n = fread(buf, 1, 24, file)) < 0) {
-					perror(fname);
-					goto error_openfile;
-				}
-				rmo_base = ((uint64_t *)buf)[0];
-				rmo_top = rmo_base + lmb_size;
-				if (rmo_top > 0x30000000UL)
-					rmo_top = 0x30000000UL;
-			}
-			fclose(file);
-			closedir(cdir);
-		} /* ibm,dynamic-reconfiguration-memory */
 
 		if (strncmp(dentry->d_name, "pci@", 4) == 0) {
 			strcat(fname, "/linux,tce-base");
@@ -587,8 +696,9 @@ static int get_devtree_details(unsigned long kexec_flags)
 			if (fread(&tce_base, sizeof(uint64_t), 1, file) != 1) {
 				perror(fname);
 				goto error_openfile;
-				return -1;
 			}
+			fclose(file);
+			tce_base = be64_to_cpu(tce_base);
 			memset(fname, 0, sizeof(fname));
 			strcpy(fname, device_tree);
 			strcat(fname, dentry->d_name);
@@ -601,6 +711,8 @@ static int get_devtree_details(unsigned long kexec_flags)
 				perror(fname);
 				goto error_openfile;
 			}
+			fclose(file);
+			tce_size = be32_to_cpu(tce_size);
 			/* Add tce to exclude_range - NON-LPAR only */
 			exclude_range[i].start = tce_base;
 			exclude_range[i].end = tce_base + tce_size;
@@ -618,13 +730,12 @@ static int get_devtree_details(unsigned long kexec_flags)
 
 	sort_ranges();
 
-#ifdef DEBUG
 	int k;
 	for (k = 0; k < i; k++)
-		fprintf(stderr, "exclude_range sorted exclude_range[%d] "
+		dbgprintf("exclude_range sorted exclude_range[%d] "
 			"start:%llx, end:%llx\n", k, exclude_range[k].start,
 			exclude_range[k].end);
-#endif
+
 	return 0;
 
 error_openfile:
@@ -711,13 +822,11 @@ int setup_memory_ranges(unsigned long kexec_flags)
 	}
 	nr_memory_ranges = j;
 
-#ifdef DEBUG
 	int k;
 	for (k = 0; k < j; k++)
-		fprintf(stderr, "setup_memory_ranges memory_range[%d] "
+		dbgprintf("setup_memory_ranges memory_range[%d] "
 			"start:%llx, end:%llx\n", k, memory_range[k].start,
 			memory_range[k].end);
-#endif
 	return 0;
 
 out:
@@ -759,11 +868,6 @@ int file_types = sizeof(file_type) / sizeof(file_type[0]);
 
 void arch_usage(void)
 {
-	fprintf(stderr, "     --command-line=<Command line> command line to append.\n");
-	fprintf(stderr, "     --append=<Command line> same as --command-line.\n");
-	fprintf(stderr, "     --ramdisk=<filename> Initial RAM disk.\n");
-	fprintf(stderr, "     --initrd=<filename> same as --ramdisk.\n");
-	fprintf(stderr, "     --devicetreeblob=<filename> Specify device tree blob file.\n");
 	fprintf(stderr, "     --elf64-core-headers Prepare core headers in ELF64 format\n");
 }
 
@@ -773,11 +877,14 @@ struct arch_options_t arch_options = {
 
 int arch_process_options(int argc, char **argv)
 {
+	/* We look for all options so getopt_long doesn't start reordering
+	 * argv[] before file_type[n].load() gets a look in.
+	 */
 	static const struct option options[] = {
-		KEXEC_ARCH_OPTIONS
+		KEXEC_ALL_OPTIONS
 		{ 0, 0, NULL, 0 },
 	};
-	static const char short_options[] = KEXEC_ARCH_OPT_STR;
+	static const char short_options[] = KEXEC_ALL_OPT_STR;
 	int opt;
 
 	opterr = 0; /* Don't complain about unrecognized options here */
@@ -801,14 +908,15 @@ const struct arch_map_entry arches[] = {
 	 * So pass KEXEC_ARCH_PPC64 here
 	 */
 	{ "ppc64", KEXEC_ARCH_PPC64 },
-	{ 0 },
+	{ "ppc64le", KEXEC_ARCH_PPC64 },
+	{ NULL, 0 },
 };
 
-int arch_compat_trampoline(struct kexec_info *info)
+int arch_compat_trampoline(struct kexec_info *UNUSED(info))
 {
 	return 0;
 }
 
-void arch_update_purgatory(struct kexec_info *info)
+void arch_update_purgatory(struct kexec_info *UNUSED(info))
 {
 }

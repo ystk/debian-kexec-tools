@@ -22,10 +22,10 @@
 #define MAX_MEMORY_RANGES 64
 static struct memory_range memory_range[MAX_MEMORY_RANGES];
 
-static int kexec_sh_memory_range_callback(void *data, int nr,
-					  char *str,
-					  unsigned long base,
-					  unsigned long length)
+static int kexec_sh_memory_range_callback(void *UNUSED(data), int nr,
+					  char *UNUSED(str),
+					  unsigned long long base,
+					  unsigned long long length)
 {
 	if (nr < MAX_MEMORY_RANGES) {
 		memory_range[nr].start = base;
@@ -73,9 +73,12 @@ int get_memory_ranges(struct memory_range **range, int *ranges,
 
 /* Supported file types and callbacks */
 struct file_type file_type[] = {
-       {"zImage-sh", zImage_sh_probe, zImage_sh_load, zImage_sh_usage},
-       {"elf-sh", elf_sh_probe, elf_sh_load, elf_sh_usage},
-       {"netbsd-sh", netbsd_sh_probe, netbsd_sh_load, netbsd_sh_usage},
+	/* uImage is probed before zImage because the latter also accepts
+	   uncompressed images. */
+	{ "uImage-sh", uImage_sh_probe, uImage_sh_load, zImage_sh_usage },
+	{ "zImage-sh", zImage_sh_probe, zImage_sh_load, zImage_sh_usage },
+	{ "elf-sh", elf_sh_probe, elf_sh_load, elf_sh_usage },
+	{ "netbsd-sh", netbsd_sh_probe, netbsd_sh_load, netbsd_sh_usage },
 };
 int file_types = sizeof(file_type) / sizeof(file_type[0]);
 
@@ -94,8 +97,13 @@ void arch_usage(void)
 
 int arch_process_options(int argc, char **argv)
 {
+	/* The common options amongst loaders (e.g. --append) should be read
+	 * here, and the loader-specific options (e.g. NetBSD stuff) should
+	 * then be re-parsed in the loader.
+	 * (e.g. in kexec-netbsd-sh.c, for example.)
+	 */
 	static const struct option options[] = {
-		KEXEC_ARCH_OPTIONS
+		KEXEC_ALL_OPTIONS
 		{ 0, 			0, NULL, 0 },
 	};
 	static const char short_options[] = KEXEC_ARCH_OPT_STR;
@@ -109,9 +117,6 @@ int arch_process_options(int argc, char **argv)
 			if (opt < OPT_MAX) {
 				break;
 			}
-		case '?':
-		        usage();
-		  	return -1;
 		case OPT_APPEND:
 		case OPT_NBSD_HOWTO:
 		case OPT_NBSD_MROOT:
@@ -132,15 +137,15 @@ const struct arch_map_entry arches[] = {
 	{ "sh4", KEXEC_ARCH_DEFAULT },
 	{ "sh4a", KEXEC_ARCH_DEFAULT },
 	{ "sh4al-dsp", KEXEC_ARCH_DEFAULT },
-	{ 0 },
+	{ NULL, 0 },
 };
 
-int arch_compat_trampoline(struct kexec_info *info)
+int arch_compat_trampoline(struct kexec_info *UNUSED(info))
 {
 	return 0;
 }
 
-void arch_update_purgatory(struct kexec_info *info)
+void arch_update_purgatory(struct kexec_info *UNUSED(info))
 {
 }
 
@@ -151,8 +156,7 @@ char *get_append(void)
         FILE *fp;
         int len;
         if((fp = fopen("/proc/cmdline", "r")) == NULL){
-              printf("/proc/cmdline file open error !!\n");
-              exit(1);
+              die("/proc/cmdline file open error !!\n");
         }
         fgets(append_buf, 256, fp);
         len = strlen(append_buf);
@@ -161,10 +165,10 @@ char *get_append(void)
         return append_buf;
 }
 
-void kexec_sh_setup_zero_page(char *zero_page_buf, int zero_page_size,
+void kexec_sh_setup_zero_page(char *zero_page_buf, size_t zero_page_size,
 			      char *cmd_line)
 {
-	int n = zero_page_size - 0x100;
+	size_t n = zero_page_size - 0x100;
 
 	memset(zero_page_buf, 0, zero_page_size);
 
@@ -177,13 +181,60 @@ void kexec_sh_setup_zero_page(char *zero_page_buf, int zero_page_size,
 	}
 }
 
+static int is_32bit(void)
+{
+	const char *cpuinfo = "/proc/cpuinfo";
+	char line[MAX_LINE];
+	FILE *fp;
+	int status = 0;
+
+	fp = fopen(cpuinfo, "r");
+	if (!fp)
+		die("Cannot open %s\n", cpuinfo);
+
+	while(fgets(line, sizeof(line), fp) != 0) {
+		const char *key = "address sizes";
+		const char *value = " 32 bits physical";
+		char *p;
+		if (strncmp(line, key, strlen(key)))
+			continue;
+		p = strchr(line + strlen(key), ':');
+		if (!p)
+			continue;
+		if (!strncmp(p + 1, value, strlen(value)))
+			status = 1;
+		break;
+	}
+
+	fclose(fp);
+
+	return status;
+}
+
 unsigned long virt_to_phys(unsigned long addr)
 {
 	unsigned long seg = addr & 0xe0000000;
-	if (seg != 0x80000000 && seg != 0xc0000000)
-		die("Virtual address %p is not in P1 or P2\n", (void *)addr);
+	unsigned long long start = 0;
+	int have_32bit = is_32bit();
 
-	return addr - seg;
+	if (seg != 0x80000000 && (have_32bit || seg != 0xc0000000))
+		die("Virtual address %p is not in P1%s\n", (void *)addr,
+		    have_32bit ? "" : " or P2");
+
+	/* If 32bit addressing is used then the base of system RAM
+	 * is an offset into physical memory. */
+	if (have_32bit) {
+		unsigned long long end;
+		int ret;
+
+		/* Assume there is only one "System RAM" region */
+		ret = parse_iomem_single("System RAM\n", &start, &end);
+		if (ret)
+			die("Could not parse System RAM region "
+			    "in /proc/iomem\n");
+	}
+
+	return addr - seg + start;
 }
 
 /*

@@ -59,7 +59,7 @@ int elf_x86_probe(const char *buf, off_t len)
 	if ((ehdr.e_machine != EM_386) && (ehdr.e_machine != EM_486)) {
 		/* for a different architecture */
 		if (probe_debug) {
-			fprintf(stderr, "Not x86_64 ELF executable\n");
+			fprintf(stderr, "Not i386 ELF executable\n");
 		}
 		result = -1;
 		goto out;
@@ -88,10 +88,12 @@ int elf_x86_load(int argc, char **argv, const char *buf, off_t len,
 	struct kexec_info *info)
 {
 	struct mem_ehdr ehdr;
-	const char *command_line;
-	char *modified_cmdline;
+	char *command_line = NULL, *modified_cmdline = NULL;
+	const char *append = NULL;
+	char *tmp_cmdline = NULL;
+	char *error_msg = NULL;
+	int result;
 	int command_line_len;
-	int modified_cmdline_len;
 	const char *ramdisk;
 	unsigned long entry, max_addr;
 	int arg_style;
@@ -99,18 +101,13 @@ int elf_x86_load(int argc, char **argv, const char *buf, off_t len,
 #define ARG_STYLE_LINUX 1
 #define ARG_STYLE_NONE  2
 	int opt;
-#define OPT_APPEND		(OPT_ARCH_MAX+0)
-#define OPT_REUSE_CMDLINE	(OPT_ARCH_MAX+1)
-#define OPT_RAMDISK		(OPT_ARCH_MAX+2)
-#define OPT_ARGS_ELF    	(OPT_ARCH_MAX+3)
-#define OPT_ARGS_LINUX  	(OPT_ARCH_MAX+4)
-#define OPT_ARGS_NONE   	(OPT_ARCH_MAX+5)
 
+	/* See options.h -- add any more there, too. */
 	static const struct option options[] = {
 		KEXEC_ARCH_OPTIONS
 		{ "command-line",	1, NULL, OPT_APPEND },
 		{ "append",		1, NULL, OPT_APPEND },
-		{ "reuse-cmdline",	1, NULL, OPT_REUSE_CMDLINE },
+		{ "reuse-cmdline",	0, NULL, OPT_REUSE_CMDLINE },
 		{ "initrd",		1, NULL, OPT_RAMDISK },
 		{ "ramdisk",		1, NULL, OPT_RAMDISK },
 		{ "args-elf",		0, NULL, OPT_ARGS_ELF },
@@ -125,10 +122,8 @@ int elf_x86_load(int argc, char **argv, const char *buf, off_t len,
 	 * Parse the command line arguments
 	 */
 	arg_style = ARG_STYLE_ELF;
-	command_line = 0;
-	modified_cmdline = 0;
-	modified_cmdline_len = 0;
 	ramdisk = 0;
+	result = 0;
 	while((opt = getopt_long(argc, argv, short_options, options, 0)) != -1) {
 		switch(opt) {
 		default:
@@ -136,14 +131,11 @@ int elf_x86_load(int argc, char **argv, const char *buf, off_t len,
 			if (opt < OPT_ARCH_MAX) {
 				break;
 			}
-		case '?':
-			usage();
-			return -1;
 		case OPT_APPEND:
-			command_line = optarg;
+			append = optarg;
 			break;
 		case OPT_REUSE_CMDLINE:
-			command_line = get_command_line();
+			tmp_cmdline = get_command_line();
 			break;
 		case OPT_RAMDISK:
 			ramdisk = optarg;
@@ -163,9 +155,16 @@ int elf_x86_load(int argc, char **argv, const char *buf, off_t len,
 			break;
 		}
 	}
+	command_line = concat_cmdline(tmp_cmdline, append);
+	if (tmp_cmdline) {
+		free(tmp_cmdline);
+	}
 	command_line_len = 0;
 	if (command_line) {
 		command_line_len = strlen(command_line) +1;
+	} else {
+	    command_line = strdup("\0");
+	    command_line_len = 1;
 	}
 
 	/* Need to append some command line parameters internally in case of
@@ -179,7 +178,6 @@ int elf_x86_load(int argc, char **argv, const char *buf, off_t len,
 						COMMAND_LINE_SIZE);
 			modified_cmdline[COMMAND_LINE_SIZE - 1] = '\0';
 		}
-		modified_cmdline_len = strlen(modified_cmdline);
 	}
 
 	/* Load the ELF executable */
@@ -191,7 +189,7 @@ int elf_x86_load(int argc, char **argv, const char *buf, off_t len,
 	/* Do we want arguments? */
 	if (arg_style != ARG_STYLE_NONE) {
 		/* Load the setup code */
-		elf_rel_build_load(info, &info->rhdr, (char *) purgatory, purgatory_size,
+		elf_rel_build_load(info, &info->rhdr, purgatory, purgatory_size,
 			0, ULONG_MAX, 1, 0);
 	}
 	if (arg_style == ARG_STYLE_NONE) {
@@ -205,7 +203,7 @@ int elf_x86_load(int argc, char **argv, const char *buf, off_t len,
 
 		/* Setup the ELF boot notes */
 		note_base = elf_boot_notes(info, max_addr,
-			(unsigned char *) command_line, command_line_len);
+					   command_line, command_line_len);
 
 		/* Initialize the stack arguments */
 		arg2 = 0; /* No return address */
@@ -220,13 +218,14 @@ int elf_x86_load(int argc, char **argv, const char *buf, off_t len,
 		elf_rel_set_symbol(&info->rhdr, "entry32_regs", &regs, sizeof(regs));
 
 		if (ramdisk) {
-			die("Ramdisks not supported with generic elf arguments");
+			error_msg = "Ramdisks not supported with generic elf arguments";
+			goto out;
 		}
 	}
 	else if (arg_style == ARG_STYLE_LINUX) {
 		struct x86_linux_faked_param_header *hdr;
 		unsigned long param_base;
-		const unsigned char *ramdisk_buf;
+		const char *ramdisk_buf;
 		off_t ramdisk_length;
 		struct entry32_regs regs;
 		int rc = 0;
@@ -253,7 +252,7 @@ int elf_x86_load(int argc, char **argv, const char *buf, off_t len,
 		ramdisk_buf = NULL;
 		ramdisk_length = 0;
 		if (ramdisk) {
-			ramdisk_buf = (unsigned char *) slurp_file(ramdisk, &ramdisk_length);
+			ramdisk_buf = slurp_file(ramdisk, &ramdisk_length);
 		}
 
 		/* If panic kernel is being loaded, additional segments need
@@ -261,11 +260,15 @@ int elf_x86_load(int argc, char **argv, const char *buf, off_t len,
 		if (info->kexec_flags & (KEXEC_ON_CRASH|KEXEC_PRESERVE_CONTEXT)) {
 			rc = load_crashdump_segments(info, modified_cmdline,
 						max_addr, 0);
-			if (rc < 0)
-				return -1;
+			if (rc < 0) {
+				result = -1;
+				goto out;
+			}
 			/* Use new command line. */
+			free(command_line);
 			command_line = modified_cmdline;
 			command_line_len = strlen(modified_cmdline) + 1;
+			modified_cmdline = NULL;
 		}
 
 		/* Tell the kernel what is going on */
@@ -275,7 +278,7 @@ int elf_x86_load(int argc, char **argv, const char *buf, off_t len,
 			ramdisk_buf, ramdisk_length);
 
 		/* Fill in the information bios calls would usually provide */
-		setup_linux_system_parameters(&hdr->hdr, info->kexec_flags);
+		setup_linux_system_parameters(info, &hdr->hdr);
 
 		/* Initialize the registers */
 		elf_rel_get_symbol(&info->rhdr, "entry32_regs", &regs, sizeof(regs));
@@ -286,7 +289,13 @@ int elf_x86_load(int argc, char **argv, const char *buf, off_t len,
 		elf_rel_set_symbol(&info->rhdr, "entry32_regs", &regs, sizeof(regs));
 	}
 	else {
-		die("Unknown argument style\n");
+		error_msg = "Unknown argument style\n";
 	}
-	return 0;
+
+out:
+	free(command_line);
+	free(modified_cmdline);
+	if (error_msg)
+		die(error_msg);
+	return result;
 }

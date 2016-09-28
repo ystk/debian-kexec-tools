@@ -45,11 +45,6 @@
 #include "crashdump-ia64.h"
 #include <arch/options.h>
 
-#define OPT_APPEND	(OPT_ARCH_MAX+0)
-#define OPT_RAMDISK	(OPT_ARCH_MAX+1)
-#define OPT_NOIO	(OPT_ARCH_MAX+2)
-#define OPT_VMM		(OPT_ARCH_MAX+3)
-
 static const int probe_debug = 0;
 extern unsigned long saved_efi_memmap_size;
 
@@ -96,19 +91,22 @@ void elf_ia64_usage(void)
 
 /* Move the crash kerenl physical offset to reserved region
  */
-void move_loaded_segments(struct kexec_info *info, struct mem_ehdr *ehdr,
-			  unsigned long addr)
+void move_loaded_segments(struct mem_ehdr *ehdr, unsigned long addr)
 {
-	int i;
-	long offset;
+	unsigned i;
+	long offset = 0;
+	int found = 0;
 	struct mem_phdr *phdr;
 	for(i = 0; i < ehdr->e_phnum; i++) {
 		phdr = &ehdr->e_phdr[i];
 		if (phdr->p_type == PT_LOAD) {
 			offset = addr - phdr->p_paddr;
+			found++;
 			break;
 		}
 	}
+	if (!found)
+		die("move_loaded_segments: no PT_LOAD region 0x%016x\n", addr);
 	ehdr->e_entry += offset;
 	for(i = 0; i < ehdr->e_phnum; i++) {
 		phdr = &ehdr->e_phdr[i];
@@ -133,6 +131,8 @@ int elf_ia64_load(int argc, char **argv, const char *buf, off_t len,
 	int result;
 	int opt;
 	char *efi_memmap_buf, *boot_param;
+
+	/* See options.h -- add any more there, too. */
 	static const struct option options[] = {
 		KEXEC_ARCH_OPTIONS
 		{"command-line", 1, 0, OPT_APPEND},
@@ -154,9 +154,6 @@ int elf_ia64_load(int argc, char **argv, const char *buf, off_t len,
 			if (opt < OPT_ARCH_MAX) {
 				break;
 			}
-		case '?':
-			usage();
-			return -1;
 		case OPT_APPEND:
 			command_line = optarg;
 			break;
@@ -198,8 +195,8 @@ int elf_ia64_load(int argc, char **argv, const char *buf, off_t len,
 			free_elf_info(&ehdr);
 			return -1;
 		}
-		move_loaded_segments(info, &ehdr, mem_min);
-	} else if (update_loaded_segments(info, &ehdr) < 0) {
+		move_loaded_segments(&ehdr, mem_min);
+	} else if (update_loaded_segments(&ehdr) < 0) {
 		fprintf(stderr, "Failed to place kernel\n");
 		return -1;
 	}
@@ -264,7 +261,7 @@ int elf_ia64_load(int argc, char **argv, const char *buf, off_t len,
 			strcat(cmdline, buf);
 		}
 
-		command_line_len = (command_line_len + 15)&(~15);
+		command_line_len = _ALIGN(command_line_len, 16);
 		command_line_base = add_buffer(info, cmdline,
 				command_line_len, command_line_len,
 				getpagesize(), 0UL,

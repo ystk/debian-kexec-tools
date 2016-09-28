@@ -31,13 +31,11 @@
 #define CRASH_MAX_MEMORY_RANGES 64
 static struct memory_range crash_memory_range[CRASH_MAX_MEMORY_RANGES];
 
-uint64_t saved_max_mem;
-
 static int crash_sh_range_nr;
-static int crash_sh_memory_range_callback(void *data, int nr,
+static int crash_sh_memory_range_callback(void *UNUSED(data), int UNUSED(nr),
 					  char *str,
-					  unsigned long base,
-					  unsigned long length)
+					  unsigned long long base,
+					  unsigned long long length)
 {
 
 	struct memory_range *range = crash_memory_range;
@@ -54,9 +52,6 @@ static int crash_sh_memory_range_callback(void *data, int nr,
 		range->end = base + length - 1;
 		range->type = RANGE_RAM;
 		crash_sh_range_nr++;
-
-		if (saved_max_mem < range->end)
-			saved_max_mem = range->end;
 	}
 
 	if (strncmp(str, "Crash kernel\n", 13) == 0) {
@@ -80,7 +75,6 @@ static int crash_sh_memory_range_callback(void *data, int nr,
 static int crash_get_memory_ranges(struct memory_range **range, int *ranges)
 {
 	crash_sh_range_nr = 0;
-	saved_max_mem = 0;
 
 	kexec_iomem_for_each_line(NULL, crash_sh_memory_range_callback, NULL);
 	*range = crash_memory_range;
@@ -142,9 +136,9 @@ static int add_cmdline_param(char *cmdline, uint64_t addr, char *cmdstr,
 	if (cmdlen > (COMMAND_LINE_SIZE - 1))
 		die("Command line overflow\n");
 	strcat(cmdline, str);
-#if DEBUG
-	fprintf(stderr, "Command line after adding elfcorehdr: %s\n", cmdline);
-#endif
+
+	dbgprintf("Command line after adding elfcorehdr: %s\n", cmdline);
+
 	return 0;
 }
 

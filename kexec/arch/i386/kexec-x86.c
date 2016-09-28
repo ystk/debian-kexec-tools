@@ -54,6 +54,8 @@ void arch_usage(void)
 		"     --console-serial          Enable the serial console\n"
 		"     --elf32-core-headers      Prepare core headers in ELF32 format\n"
 		"     --elf64-core-headers      Prepare core headers in ELF64 format\n"
+		"     --pass-memmap-cmdline     Pass memory map via command line in kexec on panic case\n"
+		"     --noefi                   Disable efi support\n"
 		);
 }
 
@@ -64,15 +66,17 @@ struct arch_options_t arch_options = {
 	.console_vga = 0,
 	.console_serial = 0,
 	.core_header_type = CORE_TYPE_UNDEF,
+	.pass_memmap_cmdline = 0,
+	.noefi = 0,
 };
 
 int arch_process_options(int argc, char **argv)
 {
 	static const struct option options[] = {
-		KEXEC_ARCH_OPTIONS
+		KEXEC_ALL_OPTIONS
 		{ 0, 			0, NULL, 0 },
 	};
-	static const char short_options[] = KEXEC_ARCH_OPT_STR;
+	static const char short_options[] = KEXEC_ALL_OPT_STR;
 	int opt;
 	unsigned long value;
 	char *end;
@@ -133,6 +137,12 @@ int arch_process_options(int argc, char **argv)
 		case OPT_ELF64_CORE:
 			arch_options.core_header_type = CORE_TYPE_ELF64;
 			break;
+		case OPT_PASS_MEMMAP_CMDLINE:
+			arch_options.pass_memmap_cmdline = 1;
+			break;
+		case OPT_NOEFI:
+			arch_options.noefi = 1;
+			break;
 		}
 	}
 	/* Reset getopt for the next pass; called in other source modules */
@@ -184,6 +194,10 @@ void arch_update_purgatory(struct kexec_info *info)
 		&arch_options.console_vga, sizeof(arch_options.console_vga));
 	elf_rel_set_symbol(&info->rhdr, "console_serial",
 		&arch_options.console_serial, sizeof(arch_options.console_serial));
+	elf_rel_set_symbol(&info->rhdr, "backup_src_start",
+		&info->backup_src_start, sizeof(info->backup_src_start));
+	elf_rel_set_symbol(&info->rhdr, "backup_src_size",
+		&info->backup_src_size, sizeof(info->backup_src_size));
 	if (info->kexec_flags & KEXEC_ON_CRASH) {
 		panic_kernel = 1;
 		elf_rel_set_symbol(&info->rhdr, "backup_start",

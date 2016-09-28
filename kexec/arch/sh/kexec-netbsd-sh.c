@@ -26,14 +26,14 @@
 #include <arch/options.h>
 
 static const int probe_debug = 0;
-const extern unsigned char netbsd_booter[];
+extern const unsigned char netbsd_booter[];
 
 /*
  * netbsd_sh_probe - sanity check the elf image
  *
  * Make sure that the file image has a reasonable chance of working.
  */
-int netbsd_sh_probe(const char *buf, off_t len)
+int netbsd_sh_probe(const char *buf, off_t UNUSED(len))
 {
 	Elf32_Ehdr *ehdr;
 
@@ -54,7 +54,7 @@ void netbsd_sh_usage(void)
 		" --miniroot=FILE      NetBSD miniroot ramdisk.\n\n");
 }
 
-int netbsd_sh_load(int argc, char **argv, const char *buf, off_t len,
+int netbsd_sh_load(int argc, char **argv, const char *buf, off_t UNUSED(len),
 	struct kexec_info *info)
 {
 	const char *howto, *miniroot;
@@ -83,9 +83,6 @@ int netbsd_sh_load(int argc, char **argv, const char *buf, off_t len,
 			if (opt < OPT_ARCH_MAX) {
 				break;
 			}
-		case '?':
-			usage();
-			return -1;
 		case OPT_NBSD_HOWTO:
 			howto = optarg;
 			break;
@@ -121,7 +118,7 @@ int netbsd_sh_load(int argc, char **argv, const char *buf, off_t len,
 		        size = bbs;
 		}
 
-		size = (size + psz - 1) & ~(psz - 1);
+		size = _ALIGN(size, psz);
 		memset(&img[bbs], 0, size-bbs);
 		add_segment(info, img, size, start, size);
 		start += size;
@@ -132,7 +129,7 @@ int netbsd_sh_load(int argc, char **argv, const char *buf, off_t len,
 	if (miniroot) {
 		miniroot_buf = slurp_file(miniroot, &miniroot_length);
 		howto_value |= 0x200;
-		size = (miniroot_length + psz - 1) & ~(psz - 1);
+		size = _ALIGN(miniroot_length, psz);
 		add_segment(info, miniroot_buf, size, start, size);
 		start += size;
 	}
