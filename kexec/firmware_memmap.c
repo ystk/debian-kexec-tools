@@ -58,7 +58,7 @@ static unsigned long long parse_numeric_sysfs(const char *filename)
 {
 	FILE *fp;
 	char linebuffer[BUFSIZ];
-	unsigned long long retval;
+	unsigned long long retval = ULLONG_MAX;
 
 	fp = fopen(filename, "r");
 	if (!fp) {
@@ -67,12 +67,15 @@ static unsigned long long parse_numeric_sysfs(const char *filename)
 		return ULLONG_MAX;
 	}
 
-	fgets(linebuffer, BUFSIZ, fp);
+	if (!fgets(linebuffer, BUFSIZ, fp))
+		goto err;
+
 	linebuffer[BUFSIZ-1] = 0;
 
 	/* let strtoll() detect the base */
 	retval = strtoll(linebuffer, NULL, 0);
 
+err:
 	fclose(fp);
 
 	return retval;
@@ -100,7 +103,11 @@ static char *parse_string_sysfs(const char *filename)
 		return NULL;
 	}
 
-	fgets(linebuffer, BUFSIZ, fp);
+	if (!fgets(linebuffer, BUFSIZ, fp)) {
+		fclose(fp);
+		return NULL;
+	}
+
 	linebuffer[BUFSIZ-1] = 0;
 
 	/* truncate trailing newline(s) */
@@ -138,7 +145,6 @@ static int parse_memmap_entry(const char *entry, struct memory_range *range)
 	range->end = parse_numeric_sysfs(filename);
 	if (range->end == ULLONG_MAX)
 		return -1;
-	range->end++; /* inclusive vs. exclusive ranges */
 
 	/*
 	 * entry/type
@@ -154,12 +160,18 @@ static int parse_memmap_entry(const char *entry, struct memory_range *range)
 		range->type = RANGE_RAM;
 	else if (strcmp(type, "ACPI Tables") == 0)
 		range->type = RANGE_ACPI;
+	else if (strcmp(type, "Unusable memory") == 0)
+		range->type = RANGE_RESERVED;
 	else if (strcmp(type, "reserved") == 0)
 		range->type = RANGE_RESERVED;
 	else if (strcmp(type, "ACPI Non-volatile Storage") == 0)
 		range->type = RANGE_ACPI_NVS;
 	else if (strcmp(type, "Uncached RAM") == 0)
 		range->type = RANGE_UNCACHED;
+	else if (strcmp(type, "Persistent Memory (legacy)") == 0)
+		range->type = RANGE_PRAM;
+	else if (strcmp(type, "Persistent Memory") == 0)
+		range->type = RANGE_PMEM;
 	else {
 		fprintf(stderr, "Unknown type (%s) while parsing %s. Please "
 			"report this as bug. Using RANGE_RESERVED now.\n",
@@ -170,18 +182,8 @@ static int parse_memmap_entry(const char *entry, struct memory_range *range)
 	return 0;
 }
 
-/**
- * Compares two memory ranges according to their start address. This function
- * can be used with qsort() as @c compar function.
- *
- * @param[in] first a pointer to the first memory range
- * @param[in] second a pointer to the second memory range
- * @return 0 if @p first and @p second have the same start address,
- *         a value less then 0 if the start address of @p first is less than
- *         the start address of @p second, and a value greater than 0 if
- *         the opposite is in case.
- */
-static int compare_ranges(const void *first, const void *second)
+/* documentation: firmware_memmap.h */
+int compare_ranges(const void *first, const void *second)
 {
 	const struct memory_range *first_range = first;
 	const struct memory_range *second_range = second;

@@ -29,7 +29,7 @@
 #include "../../kexec-elf.h"
 #include "../../kexec-syscall.h"
 #include "kexec-x86_64.h"
-#include "crashdump-x86_64.h"
+#include "../i386/crashdump-x86.h"
 #include <arch/options.h>
 
 struct file_type file_type[] = {
@@ -37,6 +37,7 @@ struct file_type file_type[] = {
 	{ "multiboot-x86", multiboot_x86_probe, multiboot_x86_load,
 	  multiboot_x86_usage },
 	{ "elf-x86", elf_x86_probe, elf_x86_load, elf_x86_usage },
+	{ "bzImage64", bzImage64_probe, bzImage64_load, bzImage64_usage },
 	{ "bzImage", bzImage_probe, bzImage_load, bzImage_usage },
 	{ "beoboot-x86", beoboot_probe, beoboot_load, beoboot_usage },
 	{ "nbi-x86", nbi_probe, nbi_load, nbi_usage },
@@ -52,32 +53,29 @@ void arch_usage(void)
 		"     --serial-baud=<baud_rate> Specify the serial port baud rate\n"
 		"     --console-vga             Enable the vga console\n"
 		"     --console-serial          Enable the serial console\n"
+		"     --pass-memmap-cmdline     Pass memory map via command line in kexec on panic case\n"
+		"     --noefi                   Disable efi support\n"
 		);
 }
 
-static struct {
-	uint8_t  reset_vga;
-	uint16_t serial_base;
-	uint32_t serial_baud;
-	uint8_t  console_vga;
-	uint8_t  console_serial;
-	int core_header_type;
-} arch_options = {
+struct arch_options_t arch_options = {
 	.reset_vga   = 0,
 	.serial_base = 0x3f8,
 	.serial_baud = 0,
 	.console_vga = 0,
 	.console_serial = 0,
 	.core_header_type = CORE_TYPE_ELF64,
+	.pass_memmap_cmdline = 0,
+	.noefi = 0,
 };
 
 int arch_process_options(int argc, char **argv)
 {
 	static const struct option options[] = {
-		KEXEC_ARCH_OPTIONS
+		KEXEC_ALL_OPTIONS
 		{ 0, 			0, NULL, 0 },
 	};
-	static const char short_options[] = KEXEC_ARCH_OPT_STR;
+	static const char short_options[] = KEXEC_ALL_OPT_STR;
 	int opt;
 	unsigned long value;
 	char *end;
@@ -132,6 +130,12 @@ int arch_process_options(int argc, char **argv)
 			}
 			arch_options.serial_baud = value;
 			break;
+		case OPT_PASS_MEMMAP_CMDLINE:
+			arch_options.pass_memmap_cmdline = 1;
+			break;
+		case OPT_NOEFI:
+			arch_options.noefi = 1;
+			break;
 		}
 	}
 	/* Reset getopt for the next pass; called in other source modules */
@@ -141,14 +145,11 @@ int arch_process_options(int argc, char **argv)
 }
 
 const struct arch_map_entry arches[] = {
-	/* For compatibility with older patches
-	 * use KEXEC_ARCH_DEFAULT instead of KEXEC_ARCH_X86_64 here.
-	 */
-	{ "x86_64", KEXEC_ARCH_DEFAULT },
-	{ 0 },
+	{ "x86_64", KEXEC_ARCH_X86_64 },
+	{ NULL, 0 },
 };
 
-int arch_compat_trampoline(struct kexec_info *info)
+int arch_compat_trampoline(struct kexec_info *UNUSED(info))
 {
 	return 0;
 }
@@ -167,6 +168,10 @@ void arch_update_purgatory(struct kexec_info *info)
 		&arch_options.console_vga, sizeof(arch_options.console_vga));
 	elf_rel_set_symbol(&info->rhdr, "console_serial",
 		&arch_options.console_serial, sizeof(arch_options.console_serial));
+	elf_rel_set_symbol(&info->rhdr, "backup_src_start",
+		&info->backup_src_start, sizeof(info->backup_src_start));
+	elf_rel_set_symbol(&info->rhdr, "backup_src_size",
+		&info->backup_src_size, sizeof(info->backup_src_size));
 
 	if (info->kexec_flags & KEXEC_ON_CRASH) {
 		panic_kernel = 1;

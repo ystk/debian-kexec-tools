@@ -147,55 +147,47 @@ int multiboot_x86_load(int argc, char **argv, const char *buf, off_t len,
 	unsigned long mbi_base;
 	struct entry32_regs regs;
 	size_t mbi_bytes, mbi_offset;
-	const char *command_line=NULL;
-	char *imagename, *cp;
+	char *command_line = NULL, *tmp_cmdline = NULL;
+	char *imagename, *cp, *append = NULL;;
 	struct memory_range *range;
 	int ranges;
 	struct AddrRangeDesc *mmap;
 	int command_line_len;
-	int i;
+	int i, result;
+	uint32_t u;
 	int opt;
 	int modules, mod_command_line_space;
-#define OPT_CL  		(OPT_ARCH_MAX+0)
-#define OPT_REUSE_CMDLINE	(OPT_ARCH_MAX+1)
-#define OPT_MOD 		(OPT_ARCH_MAX+2)
-#define OPT_VGA 		(OPT_ARCH_MAX+3)
+	/* See options.h -- add any more there, too. */
 	static const struct option options[] = {
 		KEXEC_ARCH_OPTIONS
 		{ "command-line",		1, 0, OPT_CL },
 		{ "append",			1, 0, OPT_CL },
-		{ "reuse-cmdline",		1, 0, OPT_REUSE_CMDLINE },
+		{ "reuse-cmdline",		0, 0, OPT_REUSE_CMDLINE },
 		{ "module",			1, 0, OPT_MOD },
 		{ 0, 				0, 0, 0 },
 	};
 	static const char short_options[] = KEXEC_ARCH_OPT_STR "";
 	
 	/* Probe for the MB header if it's not already found */
-	if (mbh == NULL && multiboot_x86_probe(buf, len) != 1) 
-	{
+	if (mbh == NULL && multiboot_x86_probe(buf, len) != 1) {
 		fprintf(stderr, "Cannot find a loadable multiboot header.\n");
 		return -1;
 	}
-
 	
 	/* Parse the command line */
-	command_line = "";
 	command_line_len = 0;
 	modules = 0;
 	mod_command_line_space = 0;
-	while((opt = getopt_long(argc, argv, short_options, options, 0)) != -1)
-	{
+	result = 0;
+	while((opt = getopt_long(argc, argv, short_options, options, 0)) != -1) {
 		switch(opt) {
 		default:
 			/* Ignore core options */
 			if (opt < OPT_ARCH_MAX) {
 				break;
 			}
-		case '?':
-			usage();
-			return -1;
 		case OPT_CL:
-			command_line = optarg;
+			append = optarg;
 			break;
 		case OPT_REUSE_CMDLINE:
 			command_line = get_command_line();
@@ -207,15 +199,23 @@ int multiboot_x86_load(int argc, char **argv, const char *buf, off_t len,
 		}
 	}
 	imagename = argv[optind];
-	command_line_len = strlen(command_line) + strlen(imagename) + 2;
 
-
+	/* Final command line = imagename + <OPT_REUSE_CMDLINE> + <OPT_CL> */
+	tmp_cmdline = concat_cmdline(command_line, append);
+	if (command_line) {
+		free(command_line);
+	}
+	command_line = concat_cmdline(imagename, tmp_cmdline);
+	if (tmp_cmdline) {
+		free(tmp_cmdline);
+	}
+	command_line_len = strlen(command_line) + 1;
 	
 	/* Load the ELF executable */
 	elf_exec_build_load(info, &ehdr, buf, len, 0);
 
 	/* Load the setup code */
-	elf_rel_build_load(info, &info->rhdr, (char *) purgatory, purgatory_size, 0,
+	elf_rel_build_load(info, &info->rhdr, purgatory, purgatory_size, 0,
 				ULONG_MAX, 1, 0);
 	
 	/* The first segment will contain the multiboot headers:
@@ -231,14 +231,12 @@ int multiboot_x86_load(int argc, char **argv, const char *buf, off_t len,
 	 * module command lines
 	 * ==============
 	 */
-	mbi_bytes = (sizeof(*mbi) + command_line_len 
-		     + strlen (BOOTLOADER " " BOOTLOADER_VERSION) + 1
-		     + 3) & ~3;
+	mbi_bytes = _ALIGN(sizeof(*mbi) + command_line_len
+		     + strlen (BOOTLOADER " " BOOTLOADER_VERSION) + 1, 4);
 	mbi_buf = xmalloc(mbi_bytes);
 	mbi = mbi_buf;
 	memset(mbi, 0, sizeof(*mbi));
-	sprintf(((char *)mbi) + sizeof(*mbi), "%s %s",
-		imagename, command_line);
+	sprintf(((char *)mbi) + sizeof(*mbi), "%s", command_line);
 	sprintf(((char *)mbi) + sizeof(*mbi) + command_line_len, "%s",
 		BOOTLOADER " " BOOTLOADER_VERSION);
 	mbi->flags = MB_INFO_CMDLINE | MB_INFO_BOOT_LOADER_NAME;
@@ -249,15 +247,12 @@ int multiboot_x86_load(int argc, char **argv, const char *buf, off_t len,
 	mbi->boot_loader_name = sizeof(*mbi) + command_line_len; 
 
 	/* Memory map */
-	if ((get_memory_ranges(&range, &ranges, info->kexec_flags) < 0)
-			|| ranges == 0) {
-		fprintf(stderr, "Cannot get memory information\n");
-		return -1;
-	}
+	range = info->memory_range;
+	ranges = info->memory_ranges;
 	mmap = xmalloc(ranges * sizeof(*mmap));
 	for (i=0; i<ranges; i++) {
 		unsigned long long length;
-		length = range[i].end - range[i].start;
+		length = range[i].end - range[i].start + 1;
 		/* Translate bzImage mmap to multiboot-speak */
 		mmap[i].size = sizeof(mmap[i]) - 4;
 		mmap[i].base_addr_low  = range[i].start & 0xffffffff;
@@ -266,19 +261,26 @@ int multiboot_x86_load(int argc, char **argv, const char *buf, off_t len,
 		mmap[i].length_high    = length >> 32;
 		if (range[i].type == RANGE_RAM) {
 			mmap[i].Type = 1; /* RAM */
-			/* Is this the "low" memory? */
-			if ((range[i].start == 0)
-			    && (range[i].end > mem_lower))
+			/*
+                         * Is this the "low" memory?  Can't just test
+                         * against zero, because Linux protects (and
+                         * hides) the first few pages of physical
+                         * memory.
+                         */
+
+			if ((range[i].start <= 64*1024)
+			    && (range[i].end > mem_lower)) {
+                                range[i].start = 0;
 				mem_lower = range[i].end;
+                        }
 			/* Is this the "high" memory? */
 			if ((range[i].start <= 0x100000)
 			    && (range[i].end > mem_upper + 0x100000))
 				mem_upper = range[i].end - 0x100000;
+		} else {
+			mmap[i].Type = 2;  /* Not RAM (reserved) */
 		}
-		else
-		mmap[i].Type = 0xbad;  /* Not RAM */
 	}
-
 
 	if (mbh->flags & MULTIBOOT_MEMORY_INFO) { 
 		/* Provide a copy of the memory map to the kernel */
@@ -299,7 +301,6 @@ int multiboot_x86_load(int argc, char **argv, const char *buf, off_t len,
 			
 		/* done */
 	}
-
 
 	/* Load modules */
 	if (modules) {
@@ -326,8 +327,7 @@ int multiboot_x86_load(int argc, char **argv, const char *buf, off_t len,
 		/* Go back and parse the module command lines */
 		optind = opterr = 1;
 		while((opt = getopt_long(argc, argv, 
-					 short_options, options, 0)) != -1)
-		{
+					 short_options, options, 0)) != -1) {
 			if (opt != OPT_MOD) continue;
 
 			/* Split module filename from command line */
@@ -360,22 +360,21 @@ int multiboot_x86_load(int argc, char **argv, const char *buf, off_t len,
 			mod_clp += strlen(mod_clp) + 1;
 			modp++;
 		}
-		
 	}
-
 
 	/* Find a place for the MBI to live */
 	if (sort_segments(info) < 0) {
-                return -1;
-        }
+		result = -1;
+		goto out;
+	}
 	mbi_base = add_buffer(info,
 		mbi_buf, mbi_bytes, mbi_bytes, 4, 0, 0xFFFFFFFFUL, 1);
 		
 	/* Relocate offsets in the MBI to absolute addresses */
 	mbi_offset = mbi_base;
 	modp = ((void *)mbi) + mbi->mods_addr;
-	for (i=0; i<mbi->mods_count; i++) {
-		modp[i].cmdline += mbi_offset;
+	for (u = 0; u < mbi->mods_count; u++) {
+		modp[u].cmdline += mbi_offset;
 	}
 	mbi->mods_addr += mbi_offset;
 	mbi->cmdline += mbi_offset;
@@ -388,10 +387,11 @@ int multiboot_x86_load(int argc, char **argv, const char *buf, off_t len,
 	regs.eip = ehdr.e_entry;
 	elf_rel_set_symbol(&info->rhdr, "entry32_regs", &regs, sizeof(regs));
 
-	return 0;
+out:
+	free(command_line);
+	return result;
 }
 
 /*
  *  EOF (kexec-multiboot-x86.c)
  */
-

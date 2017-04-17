@@ -21,25 +21,18 @@
 #include "kexec-mips.h"
 #include <arch/options.h>
 
-#define MAX_MEMORY_RANGES  64
-#define MAX_LINE          160
+/* Currently not used but required by top-level fs2dt code */
+off_t initrd_base = 0;
+off_t initrd_size = 0;
+
 static struct memory_range memory_range[MAX_MEMORY_RANGES];
 
 /* Return a sorted list of memory ranges. */
-int get_memory_ranges(struct memory_range **range, int *ranges, unsigned long kexec_flags)
+int get_memory_ranges(struct memory_range **range, int *ranges,
+		      unsigned long UNUSED(kexec_flags))
 {
 	int memory_ranges = 0;
 
-#if 1
-	/* this is valid for gemini2 platform based on tx4938
-	 * in our case, /proc/iomem doesn't report ram space
-	 */
-	 memory_range[memory_ranges].start = 0x00000000;
-	 memory_range[memory_ranges].end = 0x04000000;
-	 memory_range[memory_ranges].type = RANGE_RAM;
-	 memory_ranges++;
-#else
-#error Please, fix this for your platform
 	const char iomem[] = "/proc/iomem";
 	char line[MAX_LINE];
 	FILE *fp;
@@ -60,31 +53,19 @@ int get_memory_ranges(struct memory_range **range, int *ranges, unsigned long ke
 			continue;
 		str = line + consumed;
 		end = end + 1;
-#if 0
-		printf("%016Lx-%016Lx : %s\n", start, end, str);
-#endif
 		if (memcmp(str, "System RAM\n", 11) == 0) {
 			type = RANGE_RAM;
 		} else if (memcmp(str, "reserved\n", 9) == 0) {
 			type = RANGE_RESERVED;
-		} else if (memcmp(str, "ACPI Tables\n", 12) == 0) {
-			type = RANGE_ACPI;
-		} else if (memcmp(str, "ACPI Non-volatile Storage\n", 26) == 0) {
-			type = RANGE_ACPI_NVS;
 		} else {
 			continue;
 		}
 		memory_range[memory_ranges].start = start;
 		memory_range[memory_ranges].end = end;
 		memory_range[memory_ranges].type = type;
-#if 0
-		printf("%016Lx-%016Lx : %x\n", start, end, type);
-#endif
 		memory_ranges++;
 	}
 	fclose(fp);
-#endif
-
 	*range = memory_range;
 	*ranges = memory_ranges;
 	return 0;
@@ -97,27 +78,48 @@ int file_types = sizeof(file_type) / sizeof(file_type[0]);
 
 void arch_usage(void)
 {
+	printf(
+	"    --command-line=STRING Set the kernel command line to STRING.\n"
+	"    --append=STRING       Set the kernel command line to STRING.\n"
+	"    --dtb=FILE            Use FILE as the device tree blob.\n"
+	"    --initrd=FILE         Use FILE as initial ramdisk.\n"
+	);
 }
+
+struct arch_options_t arch_options = {
+#ifdef __mips64
+	.core_header_type = CORE_TYPE_ELF64,
+#else
+	.core_header_type = CORE_TYPE_ELF32,
+#endif
+};
 
 int arch_process_options(int argc, char **argv)
 {
 	static const struct option options[] = {
 		KEXEC_ARCH_OPTIONS
-		{ 0,                    0, NULL, 0 },
+		{ 0 },
 	};
 	static const char short_options[] = KEXEC_ARCH_OPT_STR;
 	int opt;
 
-	opterr = 0; /* Don't complain about unrecognized options here */
-	while((opt = getopt_long(argc, argv, short_options, options, 0)) != -1) {
-		switch(opt) {
+	while ((opt = getopt_long(argc, argv, short_options,
+				  options, 0)) != -1) {
+		switch (opt) {
+		case OPT_APPEND:
+			arch_options.command_line = optarg;
+			break;
+		case OPT_DTB:
+			arch_options.dtb_file = optarg;
+			break;
+		case OPT_RAMDISK:
+			arch_options.initrd_file = optarg;
+			break;
 		default:
 			break;
 		}
 	}
-	/* Reset getopt for the next pass; called in other source modules */
-	opterr = 1;
-	optind = 1;
+
 	return 0;
 }
 
@@ -125,31 +127,24 @@ const struct arch_map_entry arches[] = {
 	/* For compatibility with older patches
 	 * use KEXEC_ARCH_DEFAULT instead of KEXEC_ARCH_MIPS here.
 	 */
-	{ "mips", KEXEC_ARCH_DEFAULT },
-	{ 0 },
+	{ "mips", KEXEC_ARCH_MIPS },
+	{ "mips64", KEXEC_ARCH_MIPS },
+	{ NULL, 0 },
 };
 
-int arch_compat_trampoline(struct kexec_info *info)
+int arch_compat_trampoline(struct kexec_info *UNUSED(info))
 {
+
 	return 0;
 }
 
-void arch_update_purgatory(struct kexec_info *info)
+void arch_update_purgatory(struct kexec_info *UNUSED(info))
 {
-}
-
-/*
- * Adding a dummy function, so that build on mips will not break.
- * Need to implement the actual checking code
- */
-int is_crashkernel_mem_reserved(void)
-{
-	return 1;
 }
 
 unsigned long virt_to_phys(unsigned long addr)
 {
-	return addr - 0x80000000;
+	return addr & 0x7fffffff;
 }
 
 /*
@@ -158,7 +153,7 @@ unsigned long virt_to_phys(unsigned long addr)
 void add_segment(struct kexec_info *info, const void *buf, size_t bufsz,
 		 unsigned long base, size_t memsz)
 {
-	add_segment_phys_virt(info, buf, bufsz, base, memsz, 1);
+	add_segment_phys_virt(info, buf, bufsz, virt_to_phys(base), memsz, 1);
 }
 
 /*

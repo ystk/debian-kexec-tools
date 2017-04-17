@@ -18,7 +18,6 @@
  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
-#define _GNU_SOURCE
 #include <sys/types.h>
 #include <sys/stat.h>
 
@@ -30,23 +29,25 @@
 #include <errno.h>
 #include <stdio.h>
 #include "../../kexec.h"
-#include "kexec-ppc64.h"
-#include "crashdump-ppc64.h"
+#include "kexec-ppc.h"
+#include "types.h"
 
-#define MAXPATH 1024		/* max path name length */
-#define NAMESPACE 16384		/* max bytes for property names */
-#define TREEWORDS 65536		/* max 32 bit words for property values */
-#define MEMRESERVE 256		/* max number of reserved memory blocks */
-#define MAX_MEMORY_RANGES 1024
+#define MAXPATH			1024	/* max path name length */
+#define NAMESPACE		16384	/* max bytes for property names */
+#define TREEWORDS		65536	/* max 32 bit words for properties */
+#define MEMRESERVE		256	/* max number of reserved memory blks */
+#define MAX_MEMORY_RANGES	1024
+#define COMMAND_LINE_SIZE	512	/* from kernel */
 
-static char pathname[MAXPATH], *pathstart;
+static char pathname[MAXPATH];
 static char propnames[NAMESPACE] = { 0 };
-static unsigned dtstruct[TREEWORDS] __attribute__ ((aligned (8))), *dt;
+static unsigned dtstruct[TREEWORDS], *dt;
 static unsigned long long mem_rsrv[2*MEMRESERVE] = { 0, 0 };
 
-static int crash_param = 0;
+static int crash_param;
 static char local_cmdline[COMMAND_LINE_SIZE] = { "" };
-extern mem_rgns_t usablemem_rgns;
+static unsigned *dt_len; /* changed len of modified cmdline
+			    in flat device-tree */
 static struct bootblock bb[1];
 
 void reserve(unsigned long long where, unsigned long long length)
@@ -90,11 +91,13 @@ static void checkprop(char *name, unsigned *data, int len)
 		die("unrecoverable error: size and end set at same time\n");
 	if (base && size) {
 		reserve(base, size);
-		base = size = 0;
+		base = 0;
+		size = 0;
 	}
 	if (base && end) {
 		reserve(base, end-base);
-		base = end = 0;
+		base = 0;
+		end = 0;
 	}
 }
 
@@ -106,7 +109,7 @@ static unsigned propnum(const char *name)
 {
 	unsigned offset = 0;
 
-	while(propnames[offset])
+	while (propnames[offset])
 		if (strcmp(name, propnames+offset))
 			offset += strlen(propnames+offset)+1;
 		else
@@ -120,104 +123,26 @@ static unsigned propnum(const char *name)
 	return offset;
 }
 
-static void add_dyn_reconf_usable_mem_property(int fd)
-{
-	char fname[MAXPATH], *bname;
-	uint64_t buf[32];
-	uint64_t ranges[2*MAX_MEMORY_RANGES];
-	uint64_t base, end, loc_base, loc_end;
-	int range, rlen = 0, i;
-	int rngs_cnt, tmp_indx;
-
-	strcpy(fname, pathname);
-	bname = strrchr(fname, '/');
-	bname[0] = '\0';
-	bname = strrchr(fname, '/');
-	if (strncmp(bname, "/ibm,dynamic-reconfiguration-memory", 36))
-		return;
-
-	if (lseek(fd, 4, SEEK_SET) < 0)
-		die("unrecoverable error: error seeking in \"%s\": %s\n",
-			pathname, strerror(errno));
-
-	rlen = 0;
-	for (i = 0; i < num_of_lmbs; i++) {
-		if (read(fd, buf, 24) < 0)
-			die("unrecoverable error: error reading \"%s\": %s\n",
-				pathname, strerror(errno));
-
-		base = (uint64_t) buf[0];
-		end = base + lmb_size;
-		if (~0ULL - base < end)
-			die("unrecoverable error: mem property overflow\n");
-
-		tmp_indx = rlen++;
-
-		rngs_cnt = 0;
-		for (range = 0; range < usablemem_rgns.size; range++) {
-			loc_base = usablemem_rgns.ranges[range].start;
-			loc_end = usablemem_rgns.ranges[range].end;
-			if (loc_base >= base && loc_end <= end) {
-				ranges[rlen++] = loc_base;
-				ranges[rlen++] = loc_end - loc_base;
-				rngs_cnt++;
-			} else if (base < loc_end && end > loc_base) {
-				if (loc_base < base)
-					loc_base = base;
-				if (loc_end > end)
-					loc_end = end;
-				ranges[rlen++] = loc_base;
-				ranges[rlen++] = loc_end - loc_base;
-				rngs_cnt++;
-			}
-		}
-		/* Store the count of (base, size) duple */
-		ranges[tmp_indx] = rngs_cnt;
-	}
-		
-	rlen = rlen * sizeof(uint64_t);
-	/*
-	 * Add linux,drconf-usable-memory property.
-	 */
-	*dt++ = 3;
-	*dt++ = rlen;
-	*dt++ = propnum("linux,drconf-usable-memory");
-	if ((rlen >= 8) && ((unsigned long)dt & 0x4))
-		dt++;
-	memcpy(dt, &ranges, rlen);
-	dt += (rlen + 3)/4;
-}
-
 static void add_usable_mem_property(int fd, int len)
 {
 	char fname[MAXPATH], *bname;
-	uint64_t buf[2];
-	uint64_t ranges[2*MAX_MEMORY_RANGES];
-	uint64_t base, end, loc_base, loc_end;
+	unsigned long buf[2];
+	unsigned long ranges[2*MAX_MEMORY_RANGES];
+	unsigned long long base, end, loc_base, loc_end;
 	int range, rlen = 0;
 
 	strcpy(fname, pathname);
-	bname = strrchr(fname,'/');
+	bname = strrchr(fname, '/');
 	bname[0] = '\0';
-	bname = strrchr(fname,'/');
-	if (strncmp(bname, "/memory@", 8))
+	bname = strrchr(fname, '/');
+	if (strncmp(bname, "/memory@", 8) && strcmp(bname, "/memory"))
 		return;
-
-	if (len < 2 * sizeof(uint64_t))
-		die("unrecoverable error: not enough data for mem property\n");
-	len = 2 * sizeof(uint64_t);
 
 	if (lseek(fd, 0, SEEK_SET) < 0)
 		die("unrecoverable error: error seeking in \"%s\": %s\n",
 		    pathname, strerror(errno));
-	if (read(fd, buf, len) != len)
-		die("unrecoverable error: error reading \"%s\": %s\n",
-		    pathname, strerror(errno));
-
-	if (~0ULL - buf[0] < buf[1])
-		die("unrecoverable error: mem property overflow\n");
-	base = buf[0];
-	end = base + buf[1];
+	if (read_memory_region_limits(fd, &base, &end) != 0)
+		die("unrecoverable error: error parsing memory/reg limits\n");
 
 	for (range = 0; range < usablemem_rgns.size; range++) {
 		loc_base = usablemem_rgns.ranges[range].start;
@@ -245,16 +170,14 @@ static void add_usable_mem_property(int fd, int len)
 		ranges[rlen++] = 0;
 	}
 
-	rlen = rlen * sizeof(uint64_t);
+	rlen = rlen * sizeof(unsigned long);
 	/*
 	 * No add linux,usable-memory property.
 	 */
 	*dt++ = 3;
 	*dt++ = rlen;
 	*dt++ = propnum("linux,usable-memory");
-	if ((rlen >= 8) && ((unsigned long)dt & 0x4))
-		dt++;
-	memcpy(dt,&ranges,rlen);
+	memcpy(dt, &ranges, rlen);
 	dt += (rlen + 3)/4;
 }
 
@@ -270,16 +193,16 @@ static void putprops(char *fn, struct dirent **nlist, int numlist)
 		strcpy(fn, dp->d_name);
 
 		if (!strcmp(dp->d_name, ".") || !strcmp(dp->d_name, ".."))
-                        continue;
+			continue;
 
 		if (lstat(pathname, &statbuf))
 			die("unrecoverable error: could not stat \"%s\": %s\n",
 			    pathname, strerror(errno));
 
-		if (!crash_param && !strcmp(fn,"linux,crashkernel-base"))
+		if (!crash_param && !strcmp(fn, "linux,crashkernel-base"))
 			continue;
 
-		if (!crash_param && !strcmp(fn,"linux,crashkernel-size"))
+		if (!crash_param && !strcmp(fn, "linux,crashkernel-size"))
 			continue;
 
 		/*
@@ -289,7 +212,8 @@ static void putprops(char *fn, struct dirent **nlist, int numlist)
 		if (!strcmp(dp->d_name, "linux,pci-domain") ||
 			!strcmp(dp->d_name, "linux,htab-base") ||
 			!strcmp(dp->d_name, "linux,htab-size") ||
-			!strcmp(dp->d_name, "linux,kernel-end"))
+			!strcmp(dp->d_name, "linux,kernel-end") ||
+			!strcmp(dp->d_name, "linux,usable-memory"))
 				continue;
 
 		/* This property will be created/modified later in putnode()
@@ -300,23 +224,15 @@ static void putprops(char *fn, struct dirent **nlist, int numlist)
 		    !reuse_initrd)
 				continue;
 
-		/* This property will be created later in putnode() So
-		 * ignore it now.
-		 */
-		if (!strcmp(dp->d_name, "bootargs"))
-			continue;
-
-		if (! S_ISREG(statbuf.st_mode))
+		if (!S_ISREG(statbuf.st_mode))
 			continue;
 
 		len = statbuf.st_size;
 
 		*dt++ = 3;
+		dt_len = dt;
 		*dt++ = len;
 		*dt++ = propnum(fn);
-
-		if ((len >= 8) && ((unsigned long)dt & 0x4))
-			dt++;
 
 		fd = open(pathname, O_RDONLY);
 		if (fd == -1)
@@ -329,13 +245,43 @@ static void putprops(char *fn, struct dirent **nlist, int numlist)
 
 		checkprop(fn, dt, len);
 
+		/* Get the cmdline from the device-tree and modify it */
+		if (!strcmp(dp->d_name, "bootargs")) {
+			int cmd_len;
+			char temp_cmdline[COMMAND_LINE_SIZE] = { "" };
+			char *param = NULL;
+			cmd_len = strlen(local_cmdline);
+			if (cmd_len != 0) {
+				param = strstr(local_cmdline, "crashkernel=");
+				if (param)
+					crash_param = 1;
+				param = strstr(local_cmdline, "root=");
+			}
+			if (!param) {
+				char *old_param;
+				memcpy(temp_cmdline, dt, len);
+				param = strstr(temp_cmdline, "root=");
+				if (param) {
+					old_param = strtok(param, " ");
+					if (cmd_len != 0)
+						strcat(local_cmdline, " ");
+					strcat(local_cmdline, old_param);
+				}
+			}
+			strcat(local_cmdline, " ");
+			cmd_len = strlen(local_cmdline);
+			cmd_len = cmd_len + 1;
+			memcpy(dt, local_cmdline, cmd_len);
+			len = cmd_len;
+			*dt_len = cmd_len;
+
+			dbgprintf("Modified cmdline:%s\n", local_cmdline);
+
+		}
+
 		dt += (len + 3)/4;
 		if (!strcmp(dp->d_name, "reg") && usablemem_rgns.size)
 			add_usable_mem_property(fd, len);
-		if (!strcmp(dp->d_name, "ibm,dynamic-memory") &&
-					usablemem_rgns.size)
-			add_dyn_reconf_usable_mem_property(fd);
-
 		close(fd);
 	}
 
@@ -351,6 +297,8 @@ static int comparefunc(const void *dentry1, const void *dentry2)
 {
 	char *str1 = (*(struct dirent **)dentry1)->d_name;
 	char *str2 = (*(struct dirent **)dentry2)->d_name;
+	char *p1, *p2;
+	int res = 0, max_len;
 
 	/*
 	 * strcmp scans from left to right and fails to idetify for some
@@ -358,11 +306,21 @@ static int comparefunc(const void *dentry1, const void *dentry2)
 	 * Therefore, we get the wrong sorted order like memory@10000000 and
 	 * memory@f000000.
 	 */
-	if (strchr(str1, '@') && strchr(str2, '@') &&
-		(strlen(str1) > strlen(str2)))
-		return 1;
+	if ((p1 = strchr(str1, '@')) && (p2 = strchr(str2, '@'))) {
+		max_len = max(p1 - str1, p2 - str2);
+		if ((res = strncmp(str1, str2, max_len)) == 0) {
+			/* prefix is equal - compare part after '@' by length */
+			p1++; p2++;
+			res = strlen(p1) - strlen(p2);
+			if (res == 0)
+				/* equal length, compare by strcmp() */
+				res = strcmp(p1,p2);
+		}
+        } else {
+		res = strcmp(str1, str2);
+        }
 
-	return strcmp(str1, str2);
+	return res;
 }
 
 /*
@@ -378,13 +336,6 @@ static void putnode(void)
 	int numlist, i;
 	struct stat statbuf;
 
-	*dt++ = 1;
-	strcpy((void *)dt, *pathstart ? pathstart : "/");
-	while(*dt)
-		dt++;
-	if (dt[-1] & 0xff)
-		dt++;
-
 	numlist = scandir(pathname, &namelist, 0, comparefunc);
 	if (numlist < 0)
 		die("unrecoverable error: could not scan \"%s\": %s\n",
@@ -393,25 +344,35 @@ static void putnode(void)
 		die("unrecoverable error: no directory entries in \"%s\"",
 		    pathname);
 
-	basename = strrchr(pathname,'/');
+	basename = strrchr(pathname, '/') + 1;
+
+	*dt++ = 1;
+	strcpy((void *)dt, *basename ? basename : "");
+	dt += strlen((void *)dt) / sizeof(unsigned) + 1;
 
 	strcat(pathname, "/");
 	dn = pathname + strlen(pathname);
 
 	putprops(dn, namelist, numlist);
 
-	/* Add initrd entries to the second kernel */
-	if (initrd_base && !strcmp(basename,"/chosen/")) {
+	/* 
+	 * Add initrd entries to the second kernel
+	 * if
+	 * 	a) a ramdisk is specified in cmdline
+	 * 	 OR
+	 * 	b) reuseinitrd is specified and a initrd is
+	 * 	   used by the kernel.
+	 *
+	 */
+	if ((ramdisk || (initrd_base && reuse_initrd))
+		&& !strcmp(basename, "chosen/")) {
 		int len = 8;
 		unsigned long long initrd_end;
 		*dt++ = 3;
 		*dt++ = len;
 		*dt++ = propnum("linux,initrd-start");
 
-		if ((len >= 8) && ((unsigned long)dt & 0x4))
-			dt++;
-
-		memcpy(dt,&initrd_base,len);
+		memcpy(dt, &initrd_base, len);
 		dt += (len + 3)/4;
 
 		len = 8;
@@ -420,72 +381,15 @@ static void putnode(void)
 		*dt++ = propnum("linux,initrd-end");
 
 		initrd_end = initrd_base + initrd_size;
-		if ((len >= 8) && ((unsigned long)dt & 0x4))
-			dt++;
 
-		memcpy(dt,&initrd_end,len);
+		memcpy(dt, &initrd_end, len);
 		dt += (len + 3)/4;
-
-		reserve(initrd_base, initrd_size);
+		/* reserve the existing initrd image in case of reuse_initrd */
+		if (initrd_base && initrd_size && reuse_initrd)
+			reserve(initrd_base, initrd_size);
 	}
 
-	/* Add cmdline to the second kernel.  Check to see if the new
-	 * cmdline has a root=.  If not, use the old root= cmdline.  */
-	if (!strcmp(basename,"/chosen/")) {
-		size_t cmd_len = 0;
-		char *param = NULL;
-
-		cmd_len = strlen(local_cmdline);
-		if (cmd_len != 0) {
-			param = strstr(local_cmdline, "crashkernel=");
-			if (param)
-				crash_param = 1;
-			/* does the new cmdline have a root= ? ... */
-			param = strstr(local_cmdline, "root=");
-		}
-
-		/* ... if not, grab root= from the old command line */
-		if (!param) {
-			char filename[MAXPATH];
-			FILE *fp;
-			char *last_cmdline = NULL;
-			char *old_param;
-
-			strcpy(filename, pathname);
-			strcat(filename, "bootargs");
-			fp = fopen(filename, "r");
-			if (fp) {
-				if (getline(&last_cmdline, &cmd_len, fp) == -1)
-					die("unable to read %s\n", filename);
-
-				param = strstr(last_cmdline, "root=");
-				if (param) {
-					old_param = strtok(param, " ");
-					if (cmd_len != 0)
-						strcat(local_cmdline, " ");
-					strcat(local_cmdline, old_param);
-				}
-			}
-			if (last_cmdline)
-				free(last_cmdline);
-		}
-		strcat(local_cmdline, " ");
-		cmd_len = strlen(local_cmdline);
-		cmd_len = cmd_len + 1;
-
-		/* add new bootargs */
-		*dt++ = 3;
-		*dt++ = cmd_len;
-		*dt++ = propnum("bootargs");
-		if ((cmd_len >= 8) && ((unsigned long)dt & 0x4))
-			dt++;
-		memcpy(dt, local_cmdline,cmd_len);
-		dt += (cmd_len + 3)/4;
-
-		fprintf(stderr, "Modified cmdline:%s\n", local_cmdline);
-	}
-
-	for (i=0; i < numlist; i++) {
+	for (i = 0; i < numlist; i++) {
 		dp = namelist[i];
 		strcpy(dn, dp->d_name);
 		free(namelist[i]);
@@ -506,18 +410,18 @@ static void putnode(void)
 	free(namelist);
 }
 
-int create_flatten_tree(char **bufp, off_t *sizep, char *cmdline)
+int create_flatten_tree(struct kexec_info *info, unsigned char **bufp,
+			unsigned long *sizep, char *cmdline)
 {
 	unsigned long len;
 	unsigned long tlen;
-	char *buf;
+	unsigned char *buf;
 	unsigned long me;
 
 	me = 0;
 
 	strcpy(pathname, "/proc/device-tree/");
 
-	pathstart = pathname + strlen(pathname);
 	dt = dtstruct;
 
 	if (cmdline)
@@ -526,33 +430,34 @@ int create_flatten_tree(char **bufp, off_t *sizep, char *cmdline)
 	putnode();
 	*dt++ = 9;
 
-	len = sizeof(bb[0]);
-	len += 7; len &= ~7;
+	len = _ALIGN(sizeof(bb[0]), 8);
 
 	bb->off_mem_rsvmap = len;
 
 	for (len = 1; mem_rsrv[len]; len += 2)
 		;
-	len+= 3;
+	len += 3;
 	len *= sizeof(mem_rsrv[0]);
 
 	bb->off_dt_struct = bb->off_mem_rsvmap + len;
 
 	len = dt - dtstruct;
 	len *= sizeof(unsigned);
+	bb->dt_struct_size = len;
 	bb->off_dt_strings = bb->off_dt_struct + len;
 
 	len = propnum("");
-	len +=  3; len &= ~3;
+	bb->dt_strings_size = len;
+	len = _ALIGN(len, 4);
 	bb->totalsize = bb->off_dt_strings + len;
 
 	bb->magic = 0xd00dfeed;
-	bb->version = 2;
-	bb->last_comp_version = 2;
+	bb->version = 17;
+	bb->last_comp_version = 16;
 
 	reserve(me, bb->totalsize); /* patched later in kexec_load */
 
-	buf = malloc(bb->totalsize);
+	buf = (unsigned char *) malloc(bb->totalsize);
 	*bufp = buf;
 	memcpy(buf, bb, bb->off_mem_rsvmap);
 	tlen = bb->off_mem_rsvmap;

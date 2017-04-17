@@ -25,55 +25,23 @@
 #include <ip_checksum.h>
 #include "../../kexec.h"
 #include "../../kexec-elf.h"
+#include "../../kexec-syscall.h"
 #include "kexec-mips.h"
+#include "crashdump-mips.h"
 #include <arch/options.h>
+#include "../../fs2dt.h"
+#include "../../dt-ops.h"
 
 static const int probe_debug = 0;
 
 #define BOOTLOADER         "kexec"
-#define MAX_COMMAND_LINE   256
+#define UPSZ(X) _ALIGN_UP(sizeof(X), 4)
 
-#define UPSZ(X) ((sizeof(X) + 3) & ~3)
-static struct boot_notes {
-	Elf_Bhdr hdr;
-	Elf_Nhdr bl_hdr;
-	unsigned char bl_desc[UPSZ(BOOTLOADER)];
-	Elf_Nhdr blv_hdr;
-	unsigned char blv_desc[UPSZ(BOOTLOADER_VERSION)];
-	Elf_Nhdr cmd_hdr;
-	unsigned char command_line[0];
-} elf_boot_notes = {
-	.hdr = {
-		.b_signature = 0x0E1FB007,
-		.b_size = sizeof(elf_boot_notes),
-		.b_checksum = 0,
-		.b_records = 3,
-	},
-	.bl_hdr = {
-		.n_namesz = 0,
-		.n_descsz = sizeof(BOOTLOADER),
-		.n_type = EBN_BOOTLOADER_NAME,
-	},
-	.bl_desc = BOOTLOADER,
-	.blv_hdr = {
-		.n_namesz = 0,
-		.n_descsz = sizeof(BOOTLOADER_VERSION),
-		.n_type = EBN_BOOTLOADER_VERSION,
-	},
-	.blv_desc = BOOTLOADER_VERSION,
-	.cmd_hdr = {
-		.n_namesz = 0,
-		.n_descsz = 0,
-		.n_type = EBN_COMMAND_LINE,
-	},
-};
-
-
-#define OPT_APPEND	(OPT_ARCH_MAX+0)
+#define CMDLINE_PREFIX "kexec "
+static char cmdline_buf[COMMAND_LINE_SIZE] = CMDLINE_PREFIX;
 
 int elf_mips_probe(const char *buf, off_t len)
 {
-
 	struct mem_ehdr ehdr;
 	int result;
 	result = build_elf_exec_info(buf, len, &ehdr, 0);
@@ -98,84 +66,120 @@ int elf_mips_probe(const char *buf, off_t len)
 
 void elf_mips_usage(void)
 {
-	printf("    --command-line=STRING Set the kernel command line to "
-			"STRING.\n"
-	       "    --append=STRING       Set the kernel command line to "
-			"STRING.\n");
 }
 
 int elf_mips_load(int argc, char **argv, const char *buf, off_t len,
 	struct kexec_info *info)
 {
 	struct mem_ehdr ehdr;
-	char *arg_buf;
-	size_t arg_bytes;
-	unsigned long arg_base;
-	struct boot_notes *notes;
-	size_t note_bytes;
-	const char *command_line;
-	int command_line_len;
-	unsigned char *setup_start;
-	uint32_t setup_size;
-	int opt;
-	static const struct option options[] = {
-		KEXEC_ARCH_OPTIONS
-		{"command-line", 1, 0, OPT_APPEND},
-		{"append",       1, 0, OPT_APPEND},
-		{0, 0, 0, 0},
-	};
+	int command_line_len = 0;
+	char *crash_cmdline;
+	int result;
+	unsigned long cmdline_addr;
+	size_t i;
+	off_t dtb_length;
+	char *dtb_buf;
+	char *initrd_buf = NULL;
+	unsigned long long kernel_addr = 0, kernel_size = 0;
+	unsigned long pagesize = getpagesize();
 
-	static const char short_options[] = KEXEC_ARCH_OPT_STR "d";
+	/* Need to append some command line parameters internally in case of
+	 * taking crash dumps.
+	 */
+	if (info->kexec_flags & KEXEC_ON_CRASH) {
+		crash_cmdline = xmalloc(COMMAND_LINE_SIZE);
+		memset((void *)crash_cmdline, 0, COMMAND_LINE_SIZE);
+	} else
+		crash_cmdline = NULL;
 
-	command_line = 0;
-	while ((opt = getopt_long(argc, argv, short_options,
-				  options, 0)) != -1) {
-		switch (opt) {
-		default:
-			/* Ignore core options */
-			if (opt < OPT_ARCH_MAX) {
-				break;
-			}
-		case '?':
-			usage();
-			return -1;
-		case OPT_APPEND:
-			command_line = optarg;
-			break;
+	result = build_elf_exec_info(buf, len, &ehdr, 0);
+	if (result < 0)
+		die("ELF exec parse failed\n");
+
+	/* Read in the PT_LOAD segments and remove CKSEG0 mask from address*/
+	for (i = 0; i < ehdr.e_phnum; i++) {
+		struct mem_phdr *phdr;
+		phdr = &ehdr.e_phdr[i];
+		if (phdr->p_type == PT_LOAD) {
+			phdr->p_paddr = virt_to_phys(phdr->p_paddr);
+			kernel_addr = phdr->p_paddr;
+			kernel_size = phdr->p_memsz;
 		}
 	}
-	command_line_len = 0;
-	setup_simple_regs.spr9 = 0;
-	if (command_line) {
-		command_line_len = strlen(command_line) + 1;
-		setup_simple_regs.spr9 = 2;
+
+	/* Load the Elf data */
+	result = elf_exec_load(&ehdr, info);
+	if (result < 0)
+		die("ELF exec load failed\n");
+
+	info->entry = (void *)virt_to_phys(ehdr.e_entry);
+
+	if (arch_options.command_line)
+		command_line_len = strlen(arch_options.command_line) + 1;
+
+	if (info->kexec_flags & KEXEC_ON_CRASH) {
+		result = load_crashdump_segments(info, crash_cmdline,
+				0, 0);
+		if (result < 0) {
+			free(crash_cmdline);
+			return -1;
+		}
 	}
 
-	/* Load the ELF executable */
-	elf_exec_build_load(info, &ehdr, buf, len, 0);
+	if (arch_options.command_line)
+		strncat(cmdline_buf, arch_options.command_line, command_line_len);
+	if (crash_cmdline)
+		strncat(cmdline_buf, crash_cmdline,
+				sizeof(crash_cmdline) -
+				strlen(crash_cmdline) - 1);
 
-	setup_start = setup_simple_start;
-	setup_size = setup_simple_size;
-	setup_simple_regs.spr8 = ehdr.e_entry;
+	if (info->kexec_flags & KEXEC_ON_CRASH)
+		/* In case of crashdump segment[0] is kernel.
+		 * Put cmdline just after it. */
+		cmdline_addr = (unsigned long)info->segment[0].mem +
+				info->segment[0].memsz;
+	else
+		cmdline_addr = 0;
 
-	note_bytes = sizeof(elf_boot_notes) + ((command_line_len + 3) & ~3);
-	arg_bytes = note_bytes + ((setup_size + 3) & ~3);
+	/* MIPS systems that have been converted to use device tree
+	 * passed through UHI will use commandline in the DTB and
+	 * the DTB passed as a separate buffer. Note that
+	 * CMDLINE_PREFIX is skipped here intentionally, as it is
+	 * used only in the legacy method */
 
-	arg_buf = xmalloc(arg_bytes);
-	arg_base = add_buffer_virt(info,
-		 arg_buf, arg_bytes, arg_bytes, 4, 0, elf_max_addr(&ehdr), 1);
+	if (arch_options.dtb_file) {
+		dtb_buf = slurp_file(arch_options.dtb_file, &dtb_length);
+	} else {
+		create_flatten_tree(&dtb_buf, &dtb_length, cmdline_buf + strlen(CMDLINE_PREFIX));
+	}
 
-	notes = (struct boot_notes *)(arg_buf + ((setup_size + 3) & ~3));
+	if (arch_options.initrd_file) {
+		initrd_buf = slurp_file(arch_options.initrd_file, &initrd_size);
 
-	memcpy(arg_buf, setup_start, setup_size);
-	memcpy(notes, &elf_boot_notes, sizeof(elf_boot_notes));
-	memcpy(notes->command_line, command_line, command_line_len);
+		/* Create initrd entries in dtb - although at this time
+		 * they would not point to the correct location */
+		dtb_set_initrd(&dtb_buf, &dtb_length, initrd_buf, initrd_buf + initrd_size);
 
-	notes->hdr.b_size = note_bytes;
-	notes->cmd_hdr.n_descsz = command_line_len;
-	notes->hdr.b_checksum = compute_ip_checksum(notes, note_bytes);
+		initrd_base = add_buffer(info, initrd_buf, initrd_size,
+					initrd_size, sizeof(void *),
+					_ALIGN_UP(kernel_addr + kernel_size + dtb_length,
+						pagesize), 0x0fffffff, 1);
 
-	info->entry = (void *)arg_base;
+		/* Now that the buffer for initrd is prepared, update the dtb
+		 * with an appropriate location */
+		dtb_set_initrd(&dtb_buf, &dtb_length, initrd_base, initrd_base + initrd_size);
+	}
+
+
+	/* This is a legacy method for commandline passing used
+	 * currently by Octeon CPUs only */
+	add_buffer(info, cmdline_buf, sizeof(cmdline_buf),
+			sizeof(cmdline_buf), sizeof(void *),
+			cmdline_addr, 0x0fffffff, 1);
+
+	add_buffer(info, dtb_buf, dtb_length, dtb_length, 0,
+		_ALIGN_UP(kernel_addr + kernel_size, pagesize),
+		0x0fffffff, 1);
 
 	return 0;
 }

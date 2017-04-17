@@ -1,6 +1,9 @@
 #ifndef KEXEC_ELF_H
 #define KEXEC_ELF_H
 
+#include <stdint.h>
+#include <sys/types.h>
+
 struct kexec_info;
 
 struct mem_ehdr {
@@ -13,9 +16,9 @@ struct mem_ehdr {
 	unsigned e_phnum;
 	unsigned e_shnum;
 	unsigned e_shstrndx;
-	unsigned long e_entry;
-	unsigned long e_phoff;
-	unsigned long e_shoff;
+	unsigned long long e_entry;
+	unsigned long long e_phoff;
+	unsigned long long e_shoff;
 	unsigned e_notenum;
 	struct mem_phdr *e_phdr;
 	struct mem_shdr *e_shdr;
@@ -24,28 +27,28 @@ struct mem_ehdr {
 };
 
 struct mem_phdr {
-	unsigned long p_paddr;
-	unsigned long p_vaddr;
-	unsigned long p_filesz;
-	unsigned long p_memsz;
-	unsigned long p_offset;
+	unsigned long long p_paddr;
+	unsigned long long p_vaddr;
+	unsigned long long p_filesz;
+	unsigned long long p_memsz;
+	unsigned long long p_offset;
 	const char *p_data;
 	unsigned p_type;
 	unsigned p_flags;
-	unsigned p_align;
+	unsigned long long p_align;
 };
 
 struct mem_shdr {
 	unsigned sh_name;
 	unsigned sh_type;
-	unsigned long sh_flags;
-	unsigned long sh_addr;
-	unsigned long sh_offset;
-	unsigned long sh_size;
+	unsigned long long sh_flags;
+	unsigned long long sh_addr;
+	unsigned long long sh_offset;
+	unsigned long long sh_size;
 	unsigned sh_link;
 	unsigned sh_info;
-	unsigned long sh_addralign;
-	unsigned long sh_entsize;
+	unsigned long long sh_addralign;
+	unsigned long long sh_entsize;
 	const unsigned char *sh_data;
 };
 
@@ -53,16 +56,16 @@ struct mem_sym {
 	unsigned long st_name;   /* Symbol name (string tbl index) */
 	unsigned char st_info;   /* No defined meaning, 0 */
 	unsigned char st_other;  /* Symbol type and binding */
-	unsigned long st_shndx;  /* Section index */
-	unsigned long st_value;  /* Symbol value */
-	unsigned long st_size;   /* Symbol size */
+	unsigned st_shndx;  /* Section index */
+	unsigned long long st_value;  /* Symbol value */
+	unsigned long long st_size;   /* Symbol size */
 };
 
 struct  mem_rela {
-	unsigned long r_offset;
-	unsigned long r_sym;
-	unsigned long r_type;
-	unsigned long r_addend;
+	unsigned long long r_offset;
+	unsigned r_sym;
+	unsigned r_type;
+	unsigned long long r_addend;
 };
 
 struct mem_note {
@@ -126,7 +129,8 @@ unsigned long elf_max_addr(const struct mem_ehdr *ehdr);
 
 /* Architecture specific helper functions */
 extern int machine_verify_elf_rel(struct mem_ehdr *ehdr);
-extern void machine_apply_elf_rel(struct mem_ehdr *ehdr, unsigned long r_type, 
-	void *location, unsigned long address, unsigned long value);
+extern void machine_apply_elf_rel(struct mem_ehdr *ehdr, struct mem_sym *sym,
+	unsigned long r_type, void *location, unsigned long address,
+	unsigned long value);
 #endif /* KEXEC_ELF_H */
 

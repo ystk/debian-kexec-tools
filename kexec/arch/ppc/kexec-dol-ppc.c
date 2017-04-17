@@ -87,11 +87,11 @@ typedef struct {
 #define PAGE_SHIFT		12
 #define PAGE_SIZE		(1UL << PAGE_SHIFT)
 #define PAGE_MASK		(~((1 << PAGE_SHIFT) - 1))
-#define PAGE_ALIGN(addr)	(((addr) + PAGE_SIZE - 1) & PAGE_MASK)
+#define PAGE_ALIGN(addr)	_ALIGN(addr, PAGE_SIZE)
 
 #define MAX_COMMAND_LINE   256
 
-#define UPSZ(X) ((sizeof(X) + 3) & ~3)
+#define UPSZ(X) _ALIGN_UP(sizeof(X), 4)
 static struct boot_notes {
 	Elf_Bhdr hdr;
 	Elf_Nhdr bl_hdr;
@@ -265,7 +265,8 @@ int dol_ppc_probe(const char *buf, off_t dol_length)
 		}
 
 		/* end of physical storage must be within file */
-		if (dol_sect_offset(h, i) + dol_sect_size(h, i) > dol_length) {
+		if ((uintmax_t)(dol_sect_offset(h, i) + dol_sect_size(h, i)) >
+		    (uintmax_t)dol_length) {
 			if (debug) {
 				fprintf(stderr,
 					"%s segment past DOL file size\n",
@@ -310,13 +311,12 @@ int dol_ppc_probe(const char *buf, off_t dol_length)
 void dol_ppc_usage(void)
 {
 	printf
-	    ("-d, --debug               Enable debugging to help spot a failure.\n"
-	     "    --command-line=STRING Set the kernel command line to STRING.\n"
+	    ("    --command-line=STRING Set the kernel command line to STRING.\n"
 	     "    --append=STRING       Set the kernel command line to STRING.\n");
 
 }
 
-int dol_ppc_load(int argc, char **argv, const char *buf, off_t len,
+int dol_ppc_load(int argc, char **argv, const char *buf, off_t UNUSED(len),
 	struct kexec_info *info)
 {
 	dol_header header, *h;
@@ -334,21 +334,19 @@ int dol_ppc_load(int argc, char **argv, const char *buf, off_t len,
 	unsigned long lowest_start;
 	int i, j, k;
 	int opt;
-#define OPT_APPEND      (OPT_ARCH_MAX+0)
 
+	/* See options.h -- add any more there, too. */
         static const struct option options[] = {
                 KEXEC_ARCH_OPTIONS
-                {"debug",        0, 0, OPT_DEBUG},
                 {"command-line", 1, 0, OPT_APPEND},
                 {"append",       1, 0, OPT_APPEND},
                 {0, 0, 0, 0},
         };
-	static const char short_options[] = KEXEC_ARCH_OPT_STR "d";
+	static const char short_options[] = KEXEC_ARCH_OPT_STR;
 
 	/*
 	 * Parse the command line arguments
 	 */
-	debug = 0;
 	command_line = 0;
 	while ((opt = getopt_long(argc, argv, short_options, options, 0)) != -1) {
 		switch (opt) {
@@ -357,12 +355,6 @@ int dol_ppc_load(int argc, char **argv, const char *buf, off_t len,
 			if (opt < OPT_ARCH_MAX) {
 				break;
 			}
-		case '?':
-			usage();
-			return -1;
-		case OPT_DEBUG:
-			debug = 1;
-			break;
 		case OPT_APPEND:
 			command_line = optarg;
 			break;
@@ -447,14 +439,14 @@ int dol_ppc_load(int argc, char **argv, const char *buf, off_t len,
 	}
 
 	/* build the setup glue and argument segment (segment 0) */
-	note_bytes = sizeof(elf_boot_notes) + ((command_line_len + 3) & ~3);
-	arg_bytes = note_bytes + ((setup_dol_size + 3) & ~3);
+	note_bytes = sizeof(elf_boot_notes) + _ALIGN(command_line_len, 4);
+	arg_bytes = note_bytes + _ALIGN(setup_dol_size, 4);
 
 	arg_buf = xmalloc(arg_bytes);
 	arg_base = add_buffer(info,
 		arg_buf, arg_bytes, arg_bytes, 4, 0, 0xFFFFFFFFUL, 1);
 
-	notes = (struct boot_notes *)(arg_buf + ((setup_dol_size + 3) & ~3));
+	notes = (struct boot_notes *)(arg_buf + _ALIGN(setup_dol_size, 4));
 
 	notes->hdr.b_size = note_bytes;
 	notes->cmd_hdr.n_descsz = command_line_len;

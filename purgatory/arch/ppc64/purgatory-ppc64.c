@@ -28,6 +28,9 @@ unsigned long stack = 0;
 unsigned long dt_offset = 0;
 unsigned long my_toc = 0;
 unsigned long kernel = 0;
+unsigned int debug = 0;
+unsigned long opal_base = 0;
+unsigned long opal_entry = 0;
 
 void setup_arch(void)
 {

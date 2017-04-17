@@ -20,8 +20,26 @@
  */
 
 #include <purgatory.h>
+#include "hvCall.h"
+#include <byteswap.h>
+#include <endian.h>
+#include <asm/byteorder.h>
+
+extern int debug;
 
 void putchar(int c)
 {
+	char buff[16];
+	unsigned long *lbuf = (unsigned long *)buff;
+
+	if (!debug) /* running on non pseries */
+		return;
+
+	if (c == '\n')
+		putchar('\r');
+
+	buff[0] = c;
+	plpar_hcall_norets(H_PUT_TERM_CHAR, 0, 1,
+			   __cpu_to_be64(lbuf[0]), __cpu_to_be64(lbuf[1]));
 	return;
 }

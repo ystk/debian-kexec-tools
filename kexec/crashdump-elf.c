@@ -40,9 +40,8 @@ int FUNC(struct kexec_info *info,
 	uint64_t notes_addr, notes_len;
 	uint64_t vmcoreinfo_addr, vmcoreinfo_len;
 	int has_vmcoreinfo = 0;
-	uint64_t vmcoreinfo_addr_xen, vmcoreinfo_len_xen;
-	int has_vmcoreinfo_xen = 0;
 	int (*get_note_info)(int cpu, uint64_t *addr, uint64_t *len);
+	long int count_cpu;
 
 	if (xen_present())
 		nr_cpus = xen_get_nr_phys_cpus();
@@ -53,22 +52,20 @@ int FUNC(struct kexec_info *info,
 		return -1;
 	}
 
-	if (get_kernel_vmcoreinfo(&vmcoreinfo_addr, &vmcoreinfo_len) == 0) {
-		has_vmcoreinfo = 1;
-	}
+	if (xen_present()) {
+		if (!get_xen_vmcoreinfo(&vmcoreinfo_addr, &vmcoreinfo_len))
+			has_vmcoreinfo = 1;
+	} else
+		if (!get_kernel_vmcoreinfo(&vmcoreinfo_addr, &vmcoreinfo_len))
+			has_vmcoreinfo = 1;
 
-	if (xen_present() &&
-	    get_xen_vmcoreinfo(&vmcoreinfo_addr_xen, &vmcoreinfo_len_xen) == 0) {
-		has_vmcoreinfo_xen = 1;
-	}
-
-	sz = sizeof(EHDR) + (nr_cpus + has_vmcoreinfo + has_vmcoreinfo_xen) * sizeof(PHDR) +
+	sz = sizeof(EHDR) + (nr_cpus + has_vmcoreinfo) * sizeof(PHDR) +
 	     ranges * sizeof(PHDR);
 
 	/*
 	 * Certain architectures such as x86_64 and ia64 require a separate
 	 * PT_LOAD program header for the kernel. This is controlled through
-	 * info->kern_size.
+	 * elf_info->kern_size.
 	 *
 	 * The separate PT_LOAD program header is required either because the
 	 * kernel is mapped at a different location than the rest of the
@@ -85,7 +82,7 @@ int FUNC(struct kexec_info *info,
 	 * PT_LOAD program header and in the physical RAM program headers.
 	 */
 
-	if (info->kern_size && !xen_present()) {
+	if (elf_info->kern_size && !xen_present()) {
 		sz += sizeof(PHDR);
 	}
 
@@ -100,8 +97,7 @@ int FUNC(struct kexec_info *info,
 		return -1;
 	}
 
-	sz += align - 1;
-	sz &= ~(align - 1);
+	sz = _ALIGN(sz, align);
 
 	bufp = xmalloc(sz);
 	memset(bufp, 0, sz);
@@ -143,11 +139,14 @@ int FUNC(struct kexec_info *info,
 
 	/* PT_NOTE program headers. One per cpu */
 
-	for (i = 0; i < nr_cpus; i++) {
-		if (get_note_info(i, &notes_addr, &notes_len) < 0) {
-			/* This cpu is not present. Skip it. */
+	count_cpu = nr_cpus;
+	for (i = 0; count_cpu > 0; i++) {
+		int ret;
+
+		ret = get_note_info(i, &notes_addr, &notes_len);
+		count_cpu--;
+		if (ret < 0) /* This cpu is not present. Skip it. */
 			continue;
-		}
 
 		phdr = (PHDR *) bufp;
 		bufp += sizeof(PHDR);
@@ -179,33 +178,18 @@ int FUNC(struct kexec_info *info,
 		dbgprintf_phdr("vmcoreinfo header", phdr);
 	}
 
-	if (has_vmcoreinfo_xen) {
-		phdr = (PHDR *) bufp;
-		bufp += sizeof(PHDR);
-		phdr->p_type	= PT_NOTE;
-		phdr->p_flags	= 0;
-		phdr->p_offset  = phdr->p_paddr = vmcoreinfo_addr_xen;
-		phdr->p_vaddr   = 0;
-		phdr->p_filesz	= phdr->p_memsz	= vmcoreinfo_len_xen;
-		/* Do we need any alignment of segments? */
-		phdr->p_align	= 0;
-
-		(elf->e_phnum)++;
-		dbgprintf_phdr("vmcoreinfo_xen header", phdr);
-	}
-
 	/* Setup an PT_LOAD type program header for the region where
-	 * Kernel is mapped if info->kern_size is non-zero.
+	 * Kernel is mapped if elf_info->kern_size is non-zero.
 	 */
 
-	if (info->kern_size && !xen_present()) {
+	if (elf_info->kern_size && !xen_present()) {
 		phdr = (PHDR *) bufp;
 		bufp += sizeof(PHDR);
 		phdr->p_type	= PT_LOAD;
 		phdr->p_flags	= PF_R|PF_W|PF_X;
-		phdr->p_offset	= phdr->p_paddr = info->kern_paddr_start;
-		phdr->p_vaddr	= info->kern_vaddr_start;
-		phdr->p_filesz	= phdr->p_memsz	= info->kern_size;
+		phdr->p_offset	= phdr->p_paddr = elf_info->kern_paddr_start;
+		phdr->p_vaddr	= elf_info->kern_vaddr_start;
+		phdr->p_filesz	= phdr->p_memsz	= elf_info->kern_size;
 		phdr->p_align	= 0;
 		(elf->e_phnum)++;
 		dbgprintf_phdr("Kernel text Elf header", phdr);
@@ -227,8 +211,8 @@ int FUNC(struct kexec_info *info,
 		phdr->p_flags	= PF_R|PF_W|PF_X;
 		phdr->p_offset	= mstart;
 
-		if (mstart == elf_info->backup_src_start
-		    && mend == elf_info->backup_src_end)
+		if (mstart == info->backup_src_start
+		    && (mend - mstart + 1) == info->backup_src_size)
 			phdr->p_offset	= info->backup_start;
 
 		/* We already prepared the header for kernel text. Map
@@ -236,7 +220,7 @@ int FUNC(struct kexec_info *info,
 		 * memory region.
 		 */
 		phdr->p_paddr = mstart;
-		phdr->p_vaddr = mstart + elf_info->page_offset;
+		phdr->p_vaddr = phys_to_virt(elf_info, mstart);
 		phdr->p_filesz	= phdr->p_memsz	= mend - mstart + 1;
 		/* Do we need any alignment of segments? */
 		phdr->p_align	= 0;

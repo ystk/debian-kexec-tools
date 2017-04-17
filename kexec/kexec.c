@@ -26,8 +26,12 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <limits.h>
+#include <sys/ioctl.h>
+#include <sys/mount.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/reboot.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <fcntl.h>
 #ifndef _O_BINARY
@@ -38,21 +42,33 @@
 
 #include "config.h"
 
-#ifdef HAVE_LIBZ
-#include <zlib.h>
-#endif
 #include <sha256.h>
 #include "kexec.h"
 #include "kexec-syscall.h"
 #include "kexec-elf.h"
 #include "kexec-sha256.h"
+#include "kexec-zlib.h"
+#include "kexec-lzma.h"
 #include <arch/options.h>
 
 unsigned long long mem_min = 0;
 unsigned long long mem_max = ULONG_MAX;
-unsigned long kexec_flags = 0;
+static unsigned long kexec_flags = 0;
+/* Flags for kexec file (fd) based syscall */
+static unsigned long kexec_file_flags = 0;
+int kexec_debug = 0;
 
-void die(char *fmt, ...)
+void dbgprint_mem_range(const char *prefix, struct memory_range *mr, int nr_mr)
+{
+	int i;
+	dbgprintf("%s\n", prefix);
+	for (i = 0; i < nr_mr; i++) {
+		dbgprintf("%016llx-%016llx (%d)\n", mr[i].start,
+			  mr[i].end, mr[i].type);
+	}
+}
+
+void die(const char *fmt, ...)
 {
 	va_list args;
 	va_start(args, fmt);
@@ -63,13 +79,21 @@ void die(char *fmt, ...)
 	exit(1);
 }
 
+static char *xstrdup(const char *str)
+{
+	char *new = strdup(str);
+	if (!new)
+		die("Cannot strdup \"%s\": %s\n",
+			str, strerror(errno));
+	return new;
+}
 
 void *xmalloc(size_t size)
 {
 	void *buf;
-	buf = malloc(size);
 	if (!size)
 		return NULL;
+	buf = malloc(size);
 	if (!buf) {
 		die("Cannot malloc %ld bytes: %s\n",
 			size + 0UL, strerror(errno));
@@ -136,11 +160,11 @@ void print_segments(FILE *f, struct kexec_info *info)
 	for (i = 0; i < info->nr_segments; i++) {
 		fprintf(f, "segment[%d].buf   = %p\n",	i,
 			info->segment[i].buf);
-		fprintf(f, "segment[%d].bufsz = %zx\n", i,
+		fprintf(f, "segment[%d].bufsz = 0x%zx\n", i,
 			info->segment[i].bufsz);
 		fprintf(f, "segment[%d].mem   = %p\n",	i,
 			info->segment[i].mem);
-		fprintf(f, "segment[%d].memsz = %zx\n", i,
+		fprintf(f, "segment[%d].memsz = 0x%zx\n", i,
 			info->segment[i].memsz);
 	}
 }
@@ -193,15 +217,11 @@ unsigned long locate_hole(struct kexec_info *info,
 		die("Invalid hole end argument of 0 specified to locate_hole");
 	}
 
-	/* Set an intial invalid value for the hole base */
+	/* Set an initial invalid value for the hole base */
 	hole_base = ULONG_MAX;
 
-	/* Ensure I have a sane alignment value */
-	if (hole_align == 0) {
-		hole_align = 1;
-	}
 	/* Align everything to at least a page size boundary */
-	if (hole_align < getpagesize()) {
+	if (hole_align < (unsigned long)getpagesize()) {
 		hole_align = getpagesize();
 	}
 
@@ -252,8 +272,7 @@ unsigned long locate_hole(struct kexec_info *info,
 		if (start < hole_min) {
 			start = hole_min;
 		}
-		start = (start + hole_align - 1) &
-			~((unsigned long long)hole_align - 1);
+		start = _ALIGN(start, hole_align);
 		if (end > mem_max) {
 			end = mem_max;
 		}
@@ -266,25 +285,25 @@ unsigned long locate_hole(struct kexec_info *info,
 		}
 		/* Is there enough space left so we can use it? */
 		size = end - start;
-		if (size >= hole_size) {
+		if (!hole_size || size >= hole_size - 1) {
 			if (hole_end > 0) {
 				hole_base = start;
 				break;
 			} else {
-				hole_base = (end - hole_size) &
-					~((unsigned long long)hole_align - 1);
+				hole_base = _ALIGN_DOWN(end - hole_size + 1,
+					hole_align);
 			}
 		}
 	}
 	free(mem_range);
 	if (hole_base == ULONG_MAX) {
 		fprintf(stderr, "Could not find a free area of memory of "
-			"%lx bytes...\n", hole_size);
+			"0x%lx bytes...\n", hole_size);
 		return ULONG_MAX;
 	}
-	if ((hole_base + hole_size)  > hole_max) {
+	if (hole_size && (hole_base + hole_size - 1)  > hole_max) {
 		fprintf(stderr, "Could not find a free area of memory below: "
-			"%lx...\n", hole_max);
+			"0x%lx...\n", hole_max);
 		return ULONG_MAX;
 	}
 	return hole_base;
@@ -308,7 +327,7 @@ void add_segment_phys_virt(struct kexec_info *info,
 
 	/* Round memsz up to a multiple of pagesize */
 	pagesize = getpagesize();
-	memsz = (memsz + (pagesize - 1)) & ~(pagesize - 1);
+	memsz = _ALIGN(memsz, pagesize);
 
 	/* Verify base is pagesize aligned.
 	 * Finding a way to cope with this problem
@@ -317,7 +336,7 @@ void add_segment_phys_virt(struct kexec_info *info,
 	 * thing.
 	 */
 	if (base & (pagesize -1)) {
-		die("Base address: %x is not page aligned\n", base);
+		die("Base address: 0x%lx is not page aligned\n", base);
 	}
 
 	if (phys)
@@ -358,7 +377,7 @@ unsigned long add_buffer_phys_virt(struct kexec_info *info,
 
 	/* Round memsz up to a multiple of pagesize */
 	pagesize = getpagesize();
-	memsz = (memsz + (pagesize - 1)) & ~(pagesize - 1);
+	memsz = _ALIGN(memsz, pagesize);
 
 	base = locate_hole(info, memsz, buf_align, buf_min, buf_max, buf_end);
 	if (base == ULONG_MAX) {
@@ -430,8 +449,9 @@ static int find_segment_hole(struct kexec_info *info,
 	return *size;
 }
 
-int add_backup_segments(struct kexec_info *info, unsigned long backup_base,
-			unsigned long backup_size)
+static int add_backup_segments(struct kexec_info *info,
+			       unsigned long backup_base,
+			       unsigned long backup_size)
 {
 	unsigned long mem_base, mem_size, bkseg_base, bkseg_size, start, end;
 	unsigned long pagesize;
@@ -452,8 +472,8 @@ int add_backup_segments(struct kexec_info *info, unsigned long backup_base,
 				return -1;
 			if (!find_segment_hole(info, &bkseg_base, &bkseg_size))
 				break;
-			start = (bkseg_base + pagesize - 1) & ~(pagesize - 1);
-			end = (bkseg_base + bkseg_size) & ~(pagesize - 1);
+			start = _ALIGN(bkseg_base, pagesize);
+			end = _ALIGN_DOWN(bkseg_base + bkseg_size, pagesize);
 			add_segment_phys_virt(info, NULL, 0,
 					      start, end-start, 0);
 			mem_size = mem_base + mem_size - \
@@ -464,14 +484,47 @@ int add_backup_segments(struct kexec_info *info, unsigned long backup_base,
 	return 0;
 }
 
-char *slurp_file(const char *filename, off_t *r_size)
+static char *slurp_fd(int fd, const char *filename, off_t size, off_t *nread)
+{
+	char *buf;
+	off_t progress;
+	ssize_t result;
+
+	buf = xmalloc(size);
+	progress = 0;
+	while (progress < size) {
+		result = read(fd, buf + progress, size - progress);
+		if (result < 0) {
+			if ((errno == EINTR) ||	(errno == EAGAIN))
+				continue;
+			fprintf(stderr, "Read on %s failed: %s\n", filename,
+				strerror(errno));
+			free(buf);
+			close(fd);
+			return NULL;
+		}
+		if (result == 0)
+			/* EOF */
+			break;
+		progress += result;
+	}
+	result = close(fd);
+	if (result < 0)
+		die("Close of %s failed: %s\n", filename, strerror(errno));
+
+	if (nread)
+		*nread = progress;
+	return buf;
+}
+
+static char *slurp_file_generic(const char *filename, off_t *r_size,
+				int use_mmap)
 {
 	int fd;
 	char *buf;
-	off_t size, progress;
+	off_t size, err, nread;
 	ssize_t result;
 	struct stat stats;
-	
 
 	if (!filename) {
 		*r_size = 0;
@@ -487,38 +540,72 @@ char *slurp_file(const char *filename, off_t *r_size)
 		die("Cannot stat: %s: %s\n",
 			filename, strerror(errno));
 	}
-	size = stats.st_size;
-	*r_size = size;
-	buf = xmalloc(size);
-	progress = 0;
-	while(progress < size) {
-		result = read(fd, buf + progress, size - progress);
-		if (result < 0) {
-			if ((errno == EINTR) ||	(errno == EAGAIN))
-				continue;
-			die("read on %s of %ld bytes failed: %s\n", filename,
-			    (size - progress)+ 0UL, strerror(errno));
+	/*
+	 * Seek in case the kernel is a character node like /dev/ubi0_0.
+	 * This does not work on regular files which live in /proc and
+	 * we need this for some /proc/device-tree entries
+	 */
+	if (S_ISCHR(stats.st_mode)) {
+
+		size = lseek(fd, 0, SEEK_END);
+		if (size < 0)
+			die("Can not seek file %s: %s\n", filename,
+					strerror(errno));
+
+		err = lseek(fd, 0, SEEK_SET);
+		if (err < 0)
+			die("Can not seek to the begin of file %s: %s\n",
+					filename, strerror(errno));
+		buf = slurp_fd(fd, filename, size, &nread);
+	} else if (S_ISBLK(stats.st_mode)) {
+		err = ioctl(fd, BLKGETSIZE64, &size);
+		if (err < 0)
+			die("Can't retrieve size of block device %s: %s\n",
+				filename, strerror(errno));
+		buf = slurp_fd(fd, filename, size, &nread);
+	} else {
+		size = stats.st_size;
+		if (use_mmap) {
+			buf = mmap(NULL, size, PROT_READ|PROT_WRITE,
+				   MAP_PRIVATE, fd, 0);
+			nread = size;
+		} else {
+			buf = slurp_fd(fd, filename, size, &nread);
 		}
-		if (result == 0)
-			die("read on %s ended before stat said it should\n", filename);
-		progress += result;
 	}
-	result = close(fd);
-	if (result < 0) {
-		die("Close of %s failed: %s\n", filename, strerror(errno));
-	}
+	if ((use_mmap && (buf == MAP_FAILED)) || (!use_mmap && (buf == NULL)))
+		die("Cannot read %s", filename);
+
+	if (nread != size)
+		die("Read on %s ended before stat said it should\n", filename);
+
+	*r_size = size;
 	return buf;
+}
+
+/*
+ * Read file into malloced buffer.
+ */
+char *slurp_file(const char *filename, off_t *r_size)
+{
+	return slurp_file_generic(filename, r_size, 0);
+}
+
+/*
+ * Map "normal" file or read "character device" into malloced buffer.
+ * You must not use free, realloc, etc. for the returned buffer.
+ */
+char *slurp_file_mmap(const char *filename, off_t *r_size)
+{
+	return slurp_file_generic(filename, r_size, 1);
 }
 
 /* This functions reads either specified number of bytes from the file or
    lesser if EOF is met. */
 
-char *slurp_file_len(const char *filename, off_t size)
+char *slurp_file_len(const char *filename, off_t size, off_t *nread)
 {
 	int fd;
-	char *buf;
-	off_t progress;
-	ssize_t result;
 
 	if (!filename)
 		return 0;
@@ -528,93 +615,22 @@ char *slurp_file_len(const char *filename, off_t size)
 				strerror(errno));
 		return 0;
 	}
-	buf = xmalloc(size);
-	progress = 0;
-	while(progress < size) {
-		result = read(fd, buf + progress, size - progress);
-		if (result < 0) {
-			if ((errno == EINTR) ||	(errno == EAGAIN))
-				continue;
-			fprintf(stderr, "read on %s of %ld bytes failed: %s\n",
-					filename, (size - progress)+ 0UL,
-					strerror(errno));
-			free(buf);
-			return 0;
-		}
-		if (result == 0)
-			/* EOF */
-			break;
-		progress += result;
-	}
-	result = close(fd);
-	if (result < 0) {
-		die("Close of %s failed: %s\n",
-			filename, strerror(errno));
-	}
-	return buf;
+
+	return slurp_fd(fd, filename, size, nread);
 }
 
-#if HAVE_LIBZ
 char *slurp_decompress_file(const char *filename, off_t *r_size)
 {
-	gzFile fp;
-	int errnum;
-	const char *msg;
-	char *buf;
-	off_t size, allocated;
-	ssize_t result;
+	char *kernel_buf;
 
-	if (!filename) {
-		*r_size = 0;
-		return 0;
+	kernel_buf = zlib_decompress_file(filename, r_size);
+	if (!kernel_buf) {
+		kernel_buf = lzma_decompress_file(filename, r_size);
+		if (!kernel_buf)
+			return slurp_file(filename, r_size);
 	}
-	fp = gzopen(filename, "rb");
-	if (fp == 0) {
-		msg = gzerror(fp, &errnum);
-		if (errnum == Z_ERRNO) {
-			msg = strerror(errno);
-		}
-		die("Cannot open `%s': %s\n", filename, msg);
-	}
-	size = 0;
-	allocated = 65536;
-	buf = xmalloc(allocated);
-	do {
-		if (size == allocated) {
-			allocated <<= 1;
-			buf = xrealloc(buf, allocated);
-		}
-		result = gzread(fp, buf + size, allocated - size);
-		if (result < 0) {
-			if ((errno == EINTR) || (errno == EAGAIN))
-				continue;
-
-			msg = gzerror(fp, &errnum);
-			if (errnum == Z_ERRNO) {
-				msg = strerror(errno);
-			}
-			die ("read on %s of %ld bytes failed: %s\n",
-				filename, (allocated - size) + 0UL, msg);
-		}
-		size += result;
-	} while(result > 0);
-	result = gzclose(fp);
-	if (result != Z_OK) {
-		msg = gzerror(fp, &errnum);
-		if (errnum == Z_ERRNO) {
-			msg = strerror(errno);
-		}
-		die ("Close of %s failed: %s\n", filename, msg);
-	}
-	*r_size =  size;
-	return buf;
+	return kernel_buf;
 }
-#else
-char *slurp_decompress_file(const char *filename, off_t *r_size)
-{
-	return slurp_file(filename, r_size);
-}
-#endif
 
 static void update_purgatory(struct kexec_info *info)
 {
@@ -679,10 +695,6 @@ static int my_load(const char *type, int fileind, int argc, char **argv,
 	int guess_only = 0;
 
 	memset(&info, 0, sizeof(info));
-	info.segment = NULL;
-	info.nr_segments = 0;
-	info.entry = NULL;
-	info.backup_start = 0;
 	info.kexec_flags = kexec_flags;
 
 	result = 0;
@@ -694,13 +706,12 @@ static int my_load(const char *type, int fileind, int argc, char **argv,
 	kernel = argv[fileind];
 	/* slurp in the input kernel */
 	kernel_buf = slurp_decompress_file(kernel, &kernel_size);
-#if 0
-	fprintf(stderr, "kernel: %p kernel_size: %lx\n", 
-		kernel_buf, kernel_size);
-#endif
+
+	dbgprintf("kernel: %p kernel_size: %#llx\n",
+		  kernel_buf, (unsigned long long)kernel_size);
 
 	if (get_memory_ranges(&info.memory_range, &info.memory_ranges,
-		info.kexec_flags) < 0) {
+		info.kexec_flags) < 0 || info.memory_ranges == 0) {
 		fprintf(stderr, "Could not get memory layout\n");
 		return -1;
 	}
@@ -721,7 +732,7 @@ static int my_load(const char *type, int fileind, int argc, char **argv,
 	}
 	if (!type || guess_only) {
 		for (i = 0; i < file_types; i++) {
-			if (file_type[i].probe(kernel_buf, kernel_size) >= 0)
+			if (file_type[i].probe(kernel_buf, kernel_size) == 0)
 				break;
 		}
 		if (i == file_types) {
@@ -737,17 +748,29 @@ static int my_load(const char *type, int fileind, int argc, char **argv,
 			}
 		}
 	}
-	if (file_type[i].load(argc, argv, kernel_buf,
-			      kernel_size, &info) < 0) {
-		fprintf(stderr, "Cannot load %s\n", kernel);
-		return -1;
-	}
-	/* If we are not in native mode setup an appropriate trampoline */
+	/* Figure out our native architecture before load */
 	native_arch = physical_arch();
 	if (native_arch < 0) {
 		return -1;
 	}
 	info.kexec_flags |= native_arch;
+
+	result = file_type[i].load(argc, argv, kernel_buf, kernel_size, &info);
+	if (result < 0) {
+		switch (result) {
+		case ENOCRASHKERNEL:
+			fprintf(stderr,
+				"No crash kernel segment found in /proc/iomem\n"
+				"Please check the crashkernel= boot parameter.\n");
+			break;
+		case EFAILED:
+		default:
+			fprintf(stderr, "Cannot load %s\n", kernel);
+			break;
+		}
+		return result;
+	}
+	/* If we are not in native mode setup an appropriate trampoline */
 	if (arch_compat_trampoline(&info) < 0) {
 		return -1;
 	}
@@ -772,25 +795,43 @@ static int my_load(const char *type, int fileind, int argc, char **argv,
 	update_purgatory(&info);
 	if (entry)
 		info.entry = entry;
-#if 0
-	fprintf(stderr, "kexec_load: entry = %p flags = %lx\n", 
-		info.entry, info.kexec_flags);
-	print_segments(stderr, &info);
-#endif
-	result = kexec_load(
-		info.entry, info.nr_segments, info.segment, info.kexec_flags);
+
+	dbgprintf("kexec_load: entry = %p flags = 0x%lx\n",
+		  info.entry, info.kexec_flags);
+	if (kexec_debug)
+		print_segments(stderr, &info);
+
+	if (xen_present())
+		result = xen_kexec_load(&info);
+	else
+		result = kexec_load(info.entry,
+				    info.nr_segments, info.segment,
+				    info.kexec_flags);
 	if (result != 0) {
 		/* The load failed, print some debugging information */
 		fprintf(stderr, "kexec_load failed: %s\n", 
 			strerror(errno));
-		fprintf(stderr, "entry       = %p flags = %lx\n", 
+		fprintf(stderr, "entry       = %p flags = 0x%lx\n", 
 			info.entry, info.kexec_flags);
 		print_segments(stderr, &info);
 	}
 	return result;
 }
 
-int k_unload (unsigned long kexec_flags)
+static int kexec_file_unload(unsigned long kexec_file_flags)
+{
+	int ret = 0;
+
+	ret = kexec_file_load(-1, -1, 0, NULL, kexec_file_flags);
+	if (ret != 0) {
+		/* The unload failed, print some debugging information */
+		fprintf(stderr, "kexec_file_load(unload) failed\n: %s\n",
+			strerror(errno));
+	}
+	return ret;
+}
+
+static int k_unload (unsigned long kexec_flags)
 {
 	int result;
 	long native_arch;
@@ -802,10 +843,13 @@ int k_unload (unsigned long kexec_flags)
 	}
 	kexec_flags |= native_arch;
 
-	result = kexec_load(NULL, 0, NULL, kexec_flags);
+	if (xen_present())
+		result = xen_kexec_unload(kexec_flags);
+	else
+		result = kexec_load(NULL, 0, NULL, kexec_flags);
 	if (result != 0) {
 		/* The unload failed, print some debugging information */
-		fprintf(stderr, "kexec_load (0 segments) failed: %s\n",
+		fprintf(stderr, "kexec unload failed: %s\n",
 			strerror(errno));
 	}
 	return result;
@@ -836,9 +880,10 @@ static int my_shutdown(void)
  */
 static int my_exec(void)
 {
-	int result;
-
-	result = kexec_reboot();
+	if (xen_present())
+		xen_kexec_exec();
+	else
+		reboot(LINUX_REBOOT_CMD_KEXEC);
 	/* I have failed if I make it here */
 	fprintf(stderr, "kexec failed: %s\n", 
 		strerror(errno));
@@ -885,7 +930,7 @@ static int my_load_jump_back_helper(unsigned long kexec_flags, void *entry)
 
 static void version(void)
 {
-	printf(PACKAGE_STRING " released " PACKAGE_DATE "\n");
+	printf(PACKAGE_STRING "\n");
 }
 
 void usage(void)
@@ -901,8 +946,7 @@ void usage(void)
 	       " -f, --force          Force an immediate kexec,\n"
 	       "                      don't call shutdown.\n"
 	       " -x, --no-ifdown      Don't bring down network interfaces.\n"
-	       "                      (if used, must be last option\n"
-	       "                       specified)\n"
+	       " -y, --no-sync        Don't sync filesystems before kexec.\n"
 	       " -l, --load           Load the new kernel into the\n"
 	       "                      current kernel.\n"
 	       " -p, --load-panic     Load the new kernel for use on panic.\n"
@@ -920,6 +964,12 @@ void usage(void)
 	       "                      context of current kernel during kexec.\n"
 	       "     --load-jump-back-helper Load a helper image to jump back\n"
 	       "                      to original kernel.\n"
+	       "     --entry=<addr>   Specify jump back address.\n"
+	       "                      (0 means it's not jump back or\n"
+	       "                      preserve context)\n"
+	       "                      to original kernel.\n"
+	       " -s, --kexec-file-syscall Use file based syscall for kexec operation\n"
+	       " -d, --debug           Enable debugging to help spot a failure.\n"
 	       "\n"
 	       "Supported kernel file types and options: \n");
 	for (i = 0; i < file_types; i++) {
@@ -933,15 +983,36 @@ void usage(void)
 
 static int kexec_loaded(void)
 {
-	int ret;
+	long ret = -1;
 	FILE *fp;
+	char *p;
+	char line[3];
+
+	/* No way to tell if an image is loaded under Xen, assume it is. */
+	if (xen_present())
+		return 1;
 
 	fp = fopen("/sys/kernel/kexec_loaded", "r");
 	if (fp == NULL)
 		return -1;
-	fscanf(fp, "%d", &ret);
+
+	p = fgets(line, sizeof(line), fp);
 	fclose(fp);
-	return ret;
+
+	if (p == NULL)
+		return -1;
+
+	ret = strtol(line, &p, 10);
+
+	/* Too long */
+	if (ret > INT_MAX)
+		return -1;
+
+	/* No digits were found */
+	if (p == line)
+		return -1;
+
+	return (int)ret;
 }
 
 /*
@@ -989,38 +1060,136 @@ static void remove_parameter(char *line, const char *param_name)
 char *get_command_line(void)
 {
 	FILE *fp;
-	size_t len;
-	char *line = NULL;
+	char *line;
+	const int sizeof_line = 2048;
+
+	line = malloc(sizeof_line);
+	if (line == NULL)
+		die("Could not allocate memory to read /proc/cmdline.");
 
 	fp = fopen("/proc/cmdline", "r");
 	if (!fp)
-		die("Could not read /proc/cmdline.");
-	getline(&line, &len, fp);
+		die("Could not open /proc/cmdline.");
+
+	if (fgets(line, sizeof_line, fp) == NULL)
+		die("Can't read /proc/cmdline.");
+
 	fclose(fp);
 
-	if (line) {
-		/* strip newline */
-		*(line + strlen(line) - 1) = 0;
+	/* strip newline */
+	line[strlen(line) - 1] = '\0';
 
-		remove_parameter(line, "BOOT_IMAGE");
-		if (kexec_flags & KEXEC_ON_CRASH)
-			remove_parameter(line, "crashkernel");
-	} else
-		line = strdup("");
+	remove_parameter(line, "BOOT_IMAGE");
+	if (kexec_flags & KEXEC_ON_CRASH)
+		remove_parameter(line, "crashkernel");
 
 	return line;
 }
 
 /* check we retained the initrd */
-void check_reuse_initrd(void)
+static void check_reuse_initrd(void)
 {
+	char *str = NULL;
 	char *line = get_command_line();
 
-	if (strstr(line, "retain_initrd") == NULL)
+	str = strstr(line, "retain_initrd");
+	free(line);
+
+	if (str == NULL)
 		die("unrecoverable error: current boot didn't "
 		    "retain the initrd for reuse.\n");
+}
 
-	free(line);
+char *concat_cmdline(const char *base, const char *append)
+{
+	char *cmdline;
+	if (!base && !append)
+		return NULL;
+	if (append && !base)
+		return xstrdup(append);
+	if (base && !append)
+		return xstrdup(base);
+	cmdline = xmalloc(strlen(base) + 1 + strlen(append) + 1);
+	strcpy(cmdline, base);
+	strcat(cmdline, " ");
+	strcat(cmdline, append);
+	return cmdline;
+}
+
+/* New file based kexec system call related code */
+static int do_kexec_file_load(int fileind, int argc, char **argv,
+			unsigned long flags) {
+
+	char *kernel;
+	int kernel_fd, i;
+	struct kexec_info info;
+	int ret = 0;
+	char *kernel_buf;
+	off_t kernel_size;
+
+	memset(&info, 0, sizeof(info));
+	info.segment = NULL;
+	info.nr_segments = 0;
+	info.entry = NULL;
+	info.backup_start = 0;
+	info.kexec_flags = flags;
+
+	info.file_mode = 1;
+	info.initrd_fd = -1;
+
+	if (!is_kexec_file_load_implemented()) {
+		fprintf(stderr, "syscall kexec_file_load not available.\n");
+		return -1;
+	}
+
+	if (argc - fileind <= 0) {
+		fprintf(stderr, "No kernel specified\n");
+		usage();
+		return -1;
+	}
+
+	kernel = argv[fileind];
+
+	kernel_fd = open(kernel, O_RDONLY);
+	if (kernel_fd == -1) {
+		fprintf(stderr, "Failed to open file %s:%s\n", kernel,
+				strerror(errno));
+		return -1;
+	}
+
+	/* slurp in the input kernel */
+	kernel_buf = slurp_decompress_file(kernel, &kernel_size);
+
+	for (i = 0; i < file_types; i++) {
+		if (file_type[i].probe(kernel_buf, kernel_size) >= 0)
+			break;
+	}
+
+	if (i == file_types) {
+		fprintf(stderr, "Cannot determine the file type " "of %s\n",
+				kernel);
+		return -1;
+	}
+
+	ret = file_type[i].load(argc, argv, kernel_buf, kernel_size, &info);
+	if (ret < 0) {
+		fprintf(stderr, "Cannot load %s\n", kernel);
+		return ret;
+	}
+
+	/*
+	 * If there is no initramfs, set KEXEC_FILE_NO_INITRAMFS flag so that
+	 * kernel does not return error with negative initrd_fd.
+	 */
+	if (info.initrd_fd == -1)
+		info.kexec_flags |= KEXEC_FILE_NO_INITRAMFS;
+
+	ret = kexec_file_load(kernel_fd, info.initrd_fd, info.command_line_len,
+			info.command_line, info.kexec_flags);
+	if (ret != 0)
+		fprintf(stderr, "kexec_file_load failed: %s\n",
+					strerror(errno));
+	return ret;
 }
 
 
@@ -1030,10 +1199,11 @@ int main(int argc, char *argv[])
 	int do_exec = 0;
 	int do_load_jump_back_helper = 0;
 	int do_shutdown = 1;
-	int do_sync = 1;
-	int do_ifdown = 0;
+	int do_sync = 1, skip_sync = 0;
+	int do_ifdown = 0, skip_ifdown = 0;
 	int do_unload = 0;
 	int do_reuse_initrd = 0;
+	int do_kexec_file_syscall = 0;
 	void *entry = 0;
 	char *type = 0;
 	char *endptr;
@@ -1041,23 +1211,47 @@ int main(int argc, char *argv[])
 	int result = 0;
 	int fileind;
 	static const struct option options[] = {
-		KEXEC_ARCH_OPTIONS
+		KEXEC_ALL_OPTIONS
 		{ 0, 0, 0, 0},
 	};
-	static const char short_options[] = KEXEC_OPT_STR;
+	static const char short_options[] = KEXEC_ALL_OPT_STR;
 
-	opterr = 0; /* Don't complain about unrecognized options here */
+	/*
+	 * First check if --use-kexec-file-syscall is set. That changes lot of
+	 * things
+	 */
 	while ((opt = getopt_long(argc, argv, short_options,
 				  options, 0)) != -1) {
 		switch(opt) {
+		case OPT_KEXEC_FILE_SYSCALL:
+			do_kexec_file_syscall = 1;
+			break;
+		}
+	}
+
+	/* Reset getopt for the next pass. */
+	opterr = 1;
+	optind = 1;
+
+	while ((opt = getopt_long(argc, argv, short_options,
+				  options, 0)) != -1) {
+		switch(opt) {
+		case '?':
+			usage();
+			return 1;
 		case OPT_HELP:
 			usage();
 			return 0;
 		case OPT_VERSION:
 			version();
 			return 0;
+		case OPT_DEBUG:
+			kexec_debug = 1;
 		case OPT_NOIFDOWN:
-			do_ifdown = 0;
+			skip_ifdown = 1;
+			break;
+		case OPT_NOSYNC:
+			skip_sync = 1;
 			break;
 		case OPT_FORCE:
 			do_load = 1;
@@ -1076,6 +1270,8 @@ int main(int argc, char *argv[])
 			do_shutdown = 0;
 			do_sync = 0;
 			do_unload = 1;
+			if (do_kexec_file_syscall)
+				kexec_file_flags |= KEXEC_FILE_UNLOAD;
 			break;
 		case OPT_EXEC:
 			do_load = 0;
@@ -1097,7 +1293,7 @@ int main(int argc, char *argv[])
 			entry = (void *)strtoul(optarg, &endptr, 0);
 			if (*endptr) {
 				fprintf(stderr,
-					"Bad option value in --load-jump-back-helper=%s\n",
+					"Bad option value in --entry=%s\n",
 					optarg);
 				usage();
 				return 1;
@@ -1118,7 +1314,10 @@ int main(int argc, char *argv[])
 			do_exec = 0;
 			do_shutdown = 0;
 			do_sync = 0;
-			kexec_flags = KEXEC_ON_CRASH;
+			if (do_kexec_file_syscall)
+				kexec_file_flags |= KEXEC_FILE_ON_CRASH;
+			else
+				kexec_flags = KEXEC_ON_CRASH;
 			break;
 		case OPT_MEM_MIN:
 			mem_min = strtoul(optarg, &endptr, 0);
@@ -1143,23 +1342,32 @@ int main(int argc, char *argv[])
 		case OPT_REUSE_INITRD:
 			do_reuse_initrd = 1;
 			break;
+		case OPT_KEXEC_FILE_SYSCALL:
+			/* We already parsed it. Nothing to do. */
+			break;
 		default:
 			break;
 		}
 	}
 
-	if ((kexec_flags & KEXEC_ON_CRASH) && !is_crashkernel_mem_reserved()) {
-		printf("Memory for crashkernel is not reserved\n");
-		printf("Please reserve memory by passing ");
-		printf("\"crashkernel=X@Y\" parameter to the kernel\n");
-		die("Then try loading kdump kernel\n");
+	if (skip_ifdown)
+		do_ifdown = 0;
+	if (skip_sync)
+		do_sync = 0;
+
+	if (do_load && (kexec_flags & KEXEC_ON_CRASH) &&
+	    !is_crashkernel_mem_reserved()) {
+		die("Memory for crashkernel is not reserved\n"
+		    "Please reserve memory by passing"
+		    "\"crashkernel=X@Y\" parameter to kernel\n"
+		    "Then try to loading kdump kernel\n");
 	}
 
 	if (do_load && (kexec_flags & KEXEC_PRESERVE_CONTEXT) &&
 	    mem_max == ULONG_MAX) {
-		printf("Please specify memory range used by kexeced kernel\n");
-		printf("to preserve the context of original kernel with \n");
-		die("\"--mem-max\" parameter\n");
+		die("Please specify memory range used by kexeced kernel\n"
+		    "to preserve the context of original kernel with \n"
+		    "\"--mem-max\" parameter\n");
 	}
 
 	fileind = optind;
@@ -1186,10 +1394,18 @@ int main(int argc, char *argv[])
 	}
 
 	if (do_unload) {
-		result = k_unload(kexec_flags);
+		if (do_kexec_file_syscall)
+			result = kexec_file_unload(kexec_file_flags);
+		else
+			result = k_unload(kexec_flags);
 	}
 	if (do_load && (result == 0)) {
-		result = my_load(type, fileind, argc, argv, kexec_flags, entry);
+		if (do_kexec_file_syscall)
+			result = do_kexec_file_load(fileind, argc, argv,
+						 kexec_file_flags);
+		else
+			result = my_load(type, fileind, argc, argv,
+						kexec_flags, entry);
 	}
 	/* Don't shutdown unless there is something to reboot to! */
 	if ((result == 0) && (do_shutdown || do_exec) && !kexec_loaded()) {

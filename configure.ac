@@ -1,16 +1,14 @@
 dnl 
-dnl configure.ac for mkelfImage
+dnl configure.ac for kexec-tools
 dnl 
 dnl 
 
 dnl ---Required
-AC_INIT(kexec-tools, 2.0.1)
+AC_INIT(kexec-tools, 2.0.14)
 AC_CONFIG_AUX_DIR(./config)
 AC_CONFIG_HEADERS([include/config.h])
 AC_LANG(C)
-
-AC_DEFINE_UNQUOTED(PACKAGE_DATE, "13th August 2009",
-		[Define to the release date of this package])
+AC_PROG_CC
 
 
 dnl -- Compilation platform configuration
@@ -26,9 +24,18 @@ case $target_cpu in
 		;;
 	powerpc )
 		ARCH="ppc"
+		SUBARCH="BE"
 		;;
 	powerpc64 )
 		ARCH="ppc64"
+		SUBARCH="BE"
+		;;
+	powerpc64le )
+		ARCH="ppc64"
+		SUBARCH="LE"
+		;;
+	aarch64* )
+		ARCH="arm64"
 		;;
 	arm* )
 		ARCH="arm"
@@ -39,13 +46,13 @@ case $target_cpu in
 	sh4|sh4a|sh3|sh )
 		ARCH="sh"
 		;;
-	mips|mipsel )
+	mips* )
 		ARCH="mips"
 		;;
 	cris|crisv32 )
 		ARCH="cris"
 		;;
-	ia64|x86_64|alpha )
+	ia64|x86_64|alpha|m68k )
 		ARCH="$target_cpu"
 		;;
 	* )
@@ -79,14 +86,19 @@ AC_ARG_WITH([gamecube],
 AC_ARG_WITH([zlib], AC_HELP_STRING([--without-zlib],[disable zlib support]),
 	[ with_zlib="$withval"], [ with_zlib=yes ] )
 
+AC_ARG_WITH([lzma], AC_HELP_STRING([--without-lzma],[disable lzma support]),
+	[ with_lzma="$withval"], [ with_lzma=yes ] )
+
 AC_ARG_WITH([xen], AC_HELP_STRING([--without-xen],
 	[disable extended xen support]), [ with_xen="$withval"], [ with_xen=yes ] )
 
+AC_ARG_WITH([booke],
+		AC_HELP_STRING([--with-booke],[build for booke]),
+		AC_DEFINE(CONFIG_BOOKE,1,
+			[Define to build for BookE]))
+
 dnl ---Programs
 dnl To specify a different compiler, just 'export CC=/path/to/compiler'
-
-AC_PROG_CC
-
 if test "${build}" != "${host}" ; then
 	AC_CHECK_PROGS(BUILD_CC, [${build_alias}-gcc ${build}-gcc gcc])
 else
@@ -99,6 +111,7 @@ AC_CHECK_TOOL([LD], ld, "no", $PATH)
 AC_CHECK_TOOL([AS], as, "no", $PATH)
 AC_CHECK_TOOL([OBJCOPY], objcopy, "no", $PATH)
 AC_CHECK_TOOL([AR], ar, "", $PATH)
+AC_CHECK_TOOL([STRIP], strip, "no", $PATH)
 
 dnl Find compiler for target
 if test "${target}" != "${host}" ; then
@@ -138,35 +151,43 @@ AC_CHECK_PROG([DIRNAME],  dirname,  dirname,  "no", [$PATH])
 dnl See if I have a usable copy of zlib available
 if test "$with_zlib" = yes ; then
 	AC_CHECK_HEADER(zlib.h,
-		AC_CHECK_LIB(z, inflateInit_, ,
-		AC_MSG_NOTICE([zlib support disabled])))
+		[AC_CHECK_LIB(z, inflateInit_, ,
+		AC_MSG_NOTICE([zlib support disabled]))])
+fi
+
+dnl See if I have a usable copy of lzma available
+if test "$with_lzma" = yes ; then
+	AC_CHECK_HEADER(lzma.h,
+		[AC_CHECK_LIB(lzma, lzma_code, ,
+		AC_MSG_NOTICE([lzma support disabled]))])
 fi
 
 dnl find Xen control stack libraries
 if test "$with_xen" = yes ; then
 	AC_CHECK_HEADER(xenctrl.h,
-		AC_CHECK_LIB(xenctrl, xc_version, ,
-		AC_MSG_NOTICE([Xen support disabled])))
+		[AC_CHECK_LIB(xenctrl, xc_kexec_load, ,
+		AC_MSG_NOTICE([Xen support disabled]))])
 fi
 
 dnl ---Sanity checks
-if test "$CC"      = "no"; then AC_MSG_ERROR([cc not found]) fi
-if test "$CPP"     = "no"; then AC_MSG_ERROR([cpp not found]) fi
-if test "$LD"      = "no"; then AC_MSG_ERROR([ld not found]) fi
-if test "$AS"      = "no"; then AC_MSG_ERROR([as not found]) fi
-if test "$OBJCOPY" = "no"; then	AC_MSG_ERROR([objcopy not found]) fi
-if test "$AR"      = "no"; then	AC_MSG_ERROR([ar not found]) fi
+if test "$CC"      = "no"; then AC_MSG_ERROR([cc not found]); fi
+if test "$CPP"     = "no"; then AC_MSG_ERROR([cpp not found]); fi
+if test "$LD"      = "no"; then AC_MSG_ERROR([ld not found]); fi
+if test "$AS"      = "no"; then AC_MSG_ERROR([as not found]); fi
+if test "$OBJCOPY" = "no"; then	AC_MSG_ERROR([objcopy not found]); fi
+if test "$AR"      = "no"; then	AC_MSG_ERROR([ar not found]); fi
 
-if test "$MKDIR"   = "no"; then AC_MSG_ERROR([ mkdir not found]) fi 
-if test "$RM"      = "no"; then AC_MSG_ERROR([ rm not found]) fi    
-if test "$CP"      = "no"; then AC_MSG_ERROR([ cp not found]) fi    
-if test "$LN"      = "no"; then AC_MSG_ERROR([ ln not found]) fi    
-if test "$TAR"     = "no"; then AC_MSG_ERROR([ tar not found]) fi   
-if test "$RPM"     = "no"; then AC_MSG_ERROR([ rpm not found]) fi   
-if test "$SED"     = "no"; then AC_MSG_ERROR([ sed not found]) fi   
-if test "$FIND"    = "no"; then AC_MSG_ERROR([ find not found]) fi  
-if test "$XARGS"   = "no"; then AC_MSG_ERROR([ xargs not found]) fi 
-if test "$DIRNAME" = "no"; then AC_MSG_ERROR([ dirname not found]) fi 
+if test "$MKDIR"   = "no"; then AC_MSG_ERROR([ mkdir not found]); fi
+if test "$RM"      = "no"; then AC_MSG_ERROR([ rm not found]); fi
+if test "$CP"      = "no"; then AC_MSG_ERROR([ cp not found]); fi
+if test "$LN"      = "no"; then AC_MSG_ERROR([ ln not found]); fi
+if test "$TAR"     = "no"; then AC_MSG_ERROR([ tar not found]); fi
+if test "$RPM"     = "no"; then AC_MSG_ERROR([ rpm not found]); fi
+if test "$SED"     = "no"; then AC_MSG_ERROR([ sed not found]); fi
+if test "$FIND"    = "no"; then AC_MSG_ERROR([ find not found]); fi
+if test "$XARGS"   = "no"; then AC_MSG_ERROR([ xargs not found]); fi
+if test "$DIRNAME" = "no"; then AC_MSG_ERROR([ dirname not found]); fi
+if test "$STRIP"   = "no"; then AC_MSG_ERROR([ strip not found]); fi
 
 dnl ---Output variables...
 AC_SUBST([BUILD_CC])
@@ -177,6 +198,7 @@ AC_SUBST([TARGET_CFLAGS])
 AC_SUBST([ASFLAGS])
 
 AC_SUBST([ARCH])
+AC_SUBST([SUBARCH])
 AC_SUBST([OBJDIR])
 AC_SUBST([INSTALL])
 

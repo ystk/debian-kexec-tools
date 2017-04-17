@@ -18,11 +18,11 @@ clean += $(KDUMP_OBJS) $(KDUMP_DEPS) $(KDUMP) $(KDUMP_MANPAGE)
 $(KDUMP): CC=$(TARGET_CC)
 $(KDUMP): $(KDUMP_OBJS)
 	@$(MKDIR) -p $(@D)
-	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $@ $(KDUMP_OBJS)
+	$(LINK.o) -o $@ $^ $(CFLAGS) $(LIBS)
 
 $(KDUMP_MANPAGE): kdump/kdump.8
 	$(MKDIR) -p     $(MANDIR)/man8
-	cp kdump/kdump.8 $(KDUMP_MANPAGE)
+	cp $^ $(KDUMP_MANPAGE)
 echo::
 	@echo "KDUMP_SRCS $(KDUMP_SRCS)"
 	@echo "KDUMP_DEPS $(KDUMP_DEPS)"
